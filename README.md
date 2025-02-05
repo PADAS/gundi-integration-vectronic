@@ -1,5 +1,5 @@
-# gundi-integration-action-runner
-Template repo for integration in Gundi v2.
+# gundi-integration-vectronic
+Gundi connector for Vectronic tracking devices.
 
 ## Usage
 - Fork this repo
