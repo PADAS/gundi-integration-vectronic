@@ -57,21 +57,21 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             # Validate if the file is an XML file
             try:
                 root = etree.fromstring(decoded_content)
-            except etree.XMLSyntaxError:
-                raise client.VectronicBadRequestException(Exception(), f"File {index + 1} is not a valid XML file.")
+            except etree.XMLSyntaxError as e:
+                raise client.VectronicXMLParseException(e, f"File {index + 1} is not a valid XML file.")
 
             # Extract <collar ID> and <key>
             collar_element = root.find(".//collar")
             if collar_element is None:
-                raise client.VectronicBadRequestException(Exception(), "Missing <collar> element in the XML.")
+                raise client.VectronicXMLParseException(Exception("Missing <collar> element in the XML."), "Missing <collar> element in the XML.")
 
             collar_id = collar_element.get("ID")
             if not collar_id:
-                raise client.VectronicBadRequestException(Exception(), "Missing 'ID' attribute in <collar> element.")
+                raise client.VectronicXMLParseException(Exception("Missing 'ID' attribute in <collar> element."), "Missing 'ID' attribute in <collar> element.")
 
             key_element = collar_element.find("key")
             if key_element is None or not key_element.text:
-                raise client.VectronicBadRequestException(Exception(), "Missing <key> element or its value in the XML.")
+                raise client.VectronicXMLParseException(Exception("Missing <key> element or its value in the XML."), "Missing <key> element or its value in the XML.")
 
             collar_key = key_element.text
 
@@ -90,13 +90,16 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 start = device_state.get("updated_at")
 
             parsed_config = PullCollarObservationsConfig(
-                afterScts=start,
+                start=start,
                 collar_id=int(collar_id),
                 collar_key=collar_key
             )
             await trigger_action(integration.id, "fetch_collar_observations", config=parsed_config)
             collars_triggered += 1
 
+        except client.VectronicXMLParseException as e:
+            logger.exception(f"The file #{index + 1} included in config is invalid. Exception: {e}")
+            raise e
         except Exception as e:
             logger.error(f"Failed to process file {index + 1}: {e}")
             raise e
@@ -140,9 +143,5 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             return {"observations_extracted": 0}
     except (client.VectronicForbiddenException, client.VectronicNotFoundException) as e:
         message = f"Failed to authenticate with integration {integration.id} using {action_config}. Exception: {e}"
-        logger.exception(message)
-        raise e
-    except httpx.HTTPStatusError as e:
-        message = f"'fetch_collar_observations' action error with integration {integration.id} using {action_config}. Exception: {e}"
         logger.exception(message)
         raise e

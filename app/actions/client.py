@@ -57,6 +57,14 @@ class VectronicBadRequestException(Exception):
         super().__init__(f"'{self.status_code}: {self.message}, Error: {self.error}'")
 
 
+class VectronicXMLParseException(Exception):
+    def __init__(self, error: Exception, message: str, status_code=422):
+        self.status_code = status_code
+        self.message = message
+        self.error = error
+        super().__init__(f"'{self.status_code}: {self.message}, Error: {self.error}'")
+
+
 @stamina.retry(on=httpx.HTTPError, wait_initial=4.0, wait_jitter=5.0, wait_max=32.0)
 async def get_observations(integration, base_url, config):
     async with httpx.AsyncClient(timeout=120) as session:
@@ -66,7 +74,7 @@ async def get_observations(integration, base_url, config):
 
         params = {
             "collarkey": config.collar_key,
-            "afterScts": config.afterScts.isoformat().split("+")[0]
+            "afterScts": config.start.isoformat().split("+")[0]
         }
 
         try:

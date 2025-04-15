@@ -3,7 +3,7 @@ import pydantic
 from datetime import datetime, timezone
 from typing import List
 
-from app.actions.core import PullActionConfiguration
+from app.actions.core import PullActionConfiguration, InternalActionConfiguration
 from app.services.errors import ConfigurationNotFound
 from app.services.utils import find_config_for_action, FieldWithUIOptions
 
@@ -17,12 +17,12 @@ class PullObservationsConfig(PullActionConfiguration):
     default_lookback_hours: int = 12
 
 
-class PullCollarObservationsConfig(PullActionConfiguration):
-    afterScts: datetime
+class PullCollarObservationsConfig(PullActionConfiguration, InternalActionConfiguration):
+    start: datetime
     collar_id: int
     collar_key: str
 
-    @pydantic.validator('afterScts', always=True)
+    @pydantic.validator('start', always=True)
     def parse_time_string(cls, v):
         if not v.tzinfo:
             return v.replace(tzinfo=timezone.utc)
