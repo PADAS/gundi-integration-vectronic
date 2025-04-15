@@ -1,10 +1,11 @@
 import pydantic
 
+from datetime import datetime, timezone
 from typing import List
 
 from app.actions.core import GenericActionConfiguration, AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin, InternalActionConfiguration
 from app.services.errors import ConfigurationNotFound
-from app.services.utils import find_config_for_action, UIOptions, FieldWithUIOptions, GlobalUISchemaOptions
+from app.services.utils import find_config_for_action, FieldWithUIOptions
 
 
 class ProcessFileConfig(GenericActionConfiguration, ExecutableActionMixin):
@@ -21,6 +22,19 @@ class PullObservationsConfig(PullActionConfiguration):
         title="XML Files",
         description="List of XML files to be processed",
     )
+    default_lookback_hours: int = 12
+
+
+class PullCollarObservationsConfig(PullActionConfiguration):
+    afterScts: datetime
+    collar_id: int
+    collar_key: str
+
+    @pydantic.validator('afterScts', always=True)
+    def parse_time_string(cls, v):
+        if not v.tzinfo:
+            return v.replace(tzinfo=timezone.utc)
+        return v
 
 
 def get_auth_config(integration):
