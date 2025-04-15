@@ -1,7 +1,6 @@
 import httpx
 import logging
 import base64
-import xml.etree.ElementTree as ET
 
 import app.actions.client as client
 
@@ -12,6 +11,8 @@ from app.services.activity_logger import activity_logger
 from app.services.gundi import send_observations_to_gundi
 from app.services.state import IntegrationStateManager
 from app.services.utils import generate_batches
+
+from lxml import etree
 
 
 logger = logging.getLogger(__name__)
@@ -55,8 +56,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
             # Validate if the file is an XML file
             try:
-                root = ET.fromstring(decoded_content)
-            except ET.ParseError:
+                root = etree.fromstring(decoded_content)
+            except etree.XMLSyntaxError:
                 raise client.VectronicBadRequestException(Exception(), f"File {index + 1} is not a valid XML file.")
 
             # Extract <collar ID> and <key>
