@@ -17,7 +17,7 @@ class PullObservationsConfig(PullActionConfiguration):
     default_lookback_hours: int = 12
 
 
-class PullCollarObservationsConfig(PullActionConfiguration, InternalActionConfiguration):
+class PullCollarObservationsConfig(InternalActionConfiguration):
     start: datetime
     collar_id: int
     collar_key: str
