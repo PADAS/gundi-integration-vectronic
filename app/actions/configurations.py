@@ -9,8 +9,8 @@ from app.services.utils import find_config_for_action, FieldWithUIOptions
 
 class PullObservationsConfig(PullActionConfiguration):
     files: str = FieldWithUIOptions(
-        title="XML Files",
-        description="List of XML files to be processed",
+        title="JSON String of Collars",
+        description="A JSON string representing a list of collars to be processed",
     )
     default_lookback_hours: int = 12
 
