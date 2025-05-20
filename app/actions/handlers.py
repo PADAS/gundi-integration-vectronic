@@ -1,6 +1,5 @@
-import httpx
+import json
 import logging
-import base64
 
 import app.actions.client as client
 
@@ -49,60 +48,41 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     collars_triggered = 0
 
-    for index, base64_file in enumerate(action_config.files):
-        try:
-            # Decode the base64 content
-            decoded_content = base64.b64decode(base64_file)
+    try:
+        # Decode the base64 content
+        collars = json.loads(action_config.files)
 
-            # Validate if the file is an XML file
-            try:
-                root = etree.fromstring(decoded_content)
-            except etree.XMLSyntaxError as e:
-                raise client.VectronicXMLParseException(e, f"File {index + 1} is not a valid XML file.")
+        if not collars:
+            logger.warning(f"No valid collars found for integration ID {integration.id} and action_config {action_config}")
+            return {"observations_extracted": 0}
 
-            # Extract <collar ID> and <key>
-            collar_element = root.find(".//collar")
-            if collar_element is None:
-                raise client.VectronicXMLParseException(Exception("Missing <collar> element in the XML."), "Missing <collar> element in the XML.")
-
-            collar_id = collar_element.get("ID")
-            if not collar_id:
-                raise client.VectronicXMLParseException(Exception("Missing 'ID' attribute in <collar> element."), "Missing 'ID' attribute in <collar> element.")
-
-            key_element = collar_element.find("key")
-            if key_element is None or not key_element.text:
-                raise client.VectronicXMLParseException(Exception("Missing <key> element or its value in the XML."), "Missing <key> element or its value in the XML.")
-
-            collar_key = key_element.text
-
-            logger.info(f"Triggering 'action_fetch_collar_observations' action for collar {collar_id} to extract observations...")
+        for collar in collars:
+            parsed_collar = client.CollarData.parse_obj(collar["parsedData"])
+            logger.info(f"Triggering 'action_fetch_collar_observations' action for collar {parsed_collar.collarID} to extract observations...")
             now = datetime.now(timezone.utc)
             device_state = await state_manager.get_state(
                 integration_id=integration.id,
                 action_id="pull_observations",
-                source_id=collar_id
+                source_id=parsed_collar.collarID
             )
             if not device_state:
-                logger.info(f"Setting initial lookback hours for device {collar_id} to {action_config.default_lookback_hours}")
+                logger.info(f"Setting initial lookback hours for device {parsed_collar.collarID} to {action_config.default_lookback_hours}")
                 start = (now - timedelta(hours=action_config.default_lookback_hours)).strftime("%Y-%m-%dT%H:%M:%S")
             else:
-                logger.info(f"Setting begin time for device {collar_id} to {device_state.get('updated_at')}")
+                logger.info(f"Setting begin time for device {parsed_collar.collarID} to {device_state.get('updated_at')}")
                 start = device_state.get("updated_at")
 
             parsed_config = PullCollarObservationsConfig(
                 start=start,
-                collar_id=int(collar_id),
-                collar_key=collar_key
+                collar_id=int(parsed_collar.collarID),
+                collar_key=parsed_collar.key
             )
             await trigger_action(integration.id, "fetch_collar_observations", config=parsed_config)
             collars_triggered += 1
 
-        except client.VectronicXMLParseException as e:
-            logger.exception(f"The file #{index + 1} included in config is invalid. Exception: {e}")
-            raise e
-        except Exception as e:
-            logger.error(f"Failed to process file {index + 1}: {e}")
-            raise e
+    except Exception as e:
+        logger.error(f"Failed to process collars from integration ID {integration.id} and action_config {action_config}")
+        raise e
 
     return {"status": "success", "collars_triggered": collars_triggered}
 

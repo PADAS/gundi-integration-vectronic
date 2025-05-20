@@ -1,7 +1,6 @@
 import pydantic
 
 from datetime import datetime, timezone
-from typing import List
 
 from app.actions.core import PullActionConfiguration, InternalActionConfiguration
 from app.services.errors import ConfigurationNotFound
@@ -9,8 +8,7 @@ from app.services.utils import find_config_for_action, FieldWithUIOptions
 
 
 class PullObservationsConfig(PullActionConfiguration):
-    files: List[str] = FieldWithUIOptions(
-        ...,
+    files: str = FieldWithUIOptions(
         title="XML Files",
         description="List of XML files to be processed",
     )
