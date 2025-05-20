@@ -54,7 +54,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
         if not collars:
             logger.warning(f"No valid collars found for integration ID {integration.id} and action_config {action_config}")
-            return {"observations_extracted": 0}
+            return {"status": "success", "collars_triggered": 0}
 
         for collar in collars:
             parsed_collar = client.CollarData.parse_obj(collar["parsedData"])
