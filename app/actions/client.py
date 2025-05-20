@@ -11,6 +11,14 @@ logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 
+class CollarData(pydantic.BaseModel):
+    collarID: str
+    collarType: str
+    comID: str
+    comType: str
+    key: str
+
+
 class VectronicObservation(pydantic.BaseModel):
     idCollar: int
     acquisitionTime: datetime
@@ -51,14 +59,6 @@ class VectronicForbiddenException(Exception):
 
 class VectronicBadRequestException(Exception):
     def __init__(self, error: Exception, message: str, status_code=400):
-        self.status_code = status_code
-        self.message = message
-        self.error = error
-        super().__init__(f"'{self.status_code}: {self.message}, Error: {self.error}'")
-
-
-class VectronicXMLParseException(Exception):
-    def __init__(self, error: Exception, message: str, status_code=422):
         self.status_code = status_code
         self.message = message
         self.error = error
