@@ -1,7 +1,6 @@
 import logging
 import httpx
 import pydantic
-import stamina
 
 from datetime import datetime, timezone
 from app.services.state import IntegrationStateManager
@@ -57,17 +56,8 @@ class VectronicBadRequestException(Exception):
         super().__init__(f"'{self.status_code}: {self.message}, Error: {self.error}'")
 
 
-class VectronicXMLParseException(Exception):
-    def __init__(self, error: Exception, message: str, status_code=422):
-        self.status_code = status_code
-        self.message = message
-        self.error = error
-        super().__init__(f"'{self.status_code}: {self.message}, Error: {self.error}'")
-
-
-@stamina.retry(on=httpx.HTTPError, wait_initial=4.0, wait_jitter=5.0, wait_max=32.0)
 async def get_observations(integration, base_url, config):
-    async with httpx.AsyncClient(timeout=120) as session:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0)) as session:
         logger.info(f"-- Getting observations for integration ID: {integration.id} Collar ID: {config.collar_id} --")
 
         url = f"{base_url}/v2/collar/{config.collar_id}/gps"
@@ -86,7 +76,8 @@ async def get_observations(integration, base_url, config):
             if parsed_response:
                 return [VectronicObservation.parse_obj(item) for item in parsed_response]
             else:
-                return response.text
+                logger.warning(f"-- No observations returned for integration ID: {integration.id} Collar ID: {config.collar_id}: {response.text}  --")
+                return []
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 403:
                 raise VectronicForbiddenException(e, "Unauthorized access")
