@@ -1,0 +1,98 @@
+import pytest
+import json
+from unittest.mock import AsyncMock, patch, MagicMock
+from app.actions.handlers import (
+    action_pull_observations,
+    action_fetch_collar_observations,
+    CollarData,
+    transform,
+)
+from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
+
+@pytest.mark.asyncio
+@patch("app.actions.handlers.state_manager")
+@patch("app.actions.handlers.trigger_action", new_callable=AsyncMock)
+async def test_action_pull_observations_good(mock_trigger_action, mock_state_manager):
+    integration = MagicMock(id=1)
+    files = json.dumps([
+        {"parsedData": {"collarID": "1", "collarType": "A", "comID": "X", "comType": "Y", "key": "K"}}
+    ])
+    config = PullObservationsConfig(files=files, default_lookback_hours=12)
+    mock_state_manager.get_state = AsyncMock(return_value=None)
+    result = await action_pull_observations(integration, config)
+    assert result["status"] == "success"
+    assert result["collars_triggered"] == 1
+
+@pytest.mark.asyncio
+@patch("app.actions.handlers.state_manager")
+async def test_action_pull_observations_bad_json(mock_state_manager):
+    integration = MagicMock(id=1)
+    config = PullObservationsConfig(files="not a json", default_lookback_hours=12)
+    with pytest.raises(json.JSONDecodeError):
+        await action_pull_observations(integration, config)
+
+@pytest.mark.asyncio
+@patch("app.actions.handlers.state_manager")
+@patch("app.actions.handlers.trigger_action", new_callable=AsyncMock)
+async def test_action_pull_observations_empty_list(mock_trigger_action, mock_state_manager):
+    integration = MagicMock(id=1)
+    config = PullObservationsConfig(files="[]", default_lookback_hours=12)
+    result = await action_pull_observations(integration, config)
+    assert result["status"] == "success"
+    assert result["collars_triggered"] == 0
+
+@pytest.mark.asyncio
+@patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
+@patch("app.actions.handlers.send_observations_to_gundi", new_callable=AsyncMock)
+@patch("app.actions.handlers.state_manager")
+async def test_action_fetch_collar_observations_good(mock_state_manager, mock_send, mock_get_obs):
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    obs = MagicMock(idCollar="1", acquisitionTime=MagicMock(strftime=lambda fmt: "2024-01-01T00:00:00"), latitude=1.0, longitude=2.0)
+    mock_get_obs.return_value = [obs]
+    mock_send.return_value = [obs]
+    mock_state_manager.set_state = AsyncMock()
+    result = await action_fetch_collar_observations(integration, config)
+    assert result["observations_extracted"] == 1
+
+@pytest.mark.asyncio
+@patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
+async def test_action_fetch_collar_observations_no_observations(mock_get_obs):
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    mock_get_obs.return_value = []
+    result = await action_fetch_collar_observations(integration, config)
+    assert result["observations_extracted"] == 0
+
+@pytest.mark.asyncio
+@patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
+async def test_action_fetch_collar_observations_exception(mock_get_obs):
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    mock_get_obs.side_effect = Exception("fail")
+    with pytest.raises(Exception):
+        await action_fetch_collar_observations(integration, config)
+
+def test_transform_good():
+    class Obs:
+        idCollar = "1"
+        acquisitionTime = "2024-01-01T00:00:00"
+        latitude = 1.0
+        longitude = 2.0
+        foo = "bar"
+        def dict(self):
+            return self.__dict__
+    obs = Obs()
+    result = transform(obs)
+    assert result["source_name"] == "1"
+    assert result["location"]["lat"] == 1.0
+
+def test_collar_data_good():
+    data = {"collarID": "1", "collarType": "A", "comID": "X", "comType": "Y", "key": "K"}
+    model = CollarData.parse_obj(data)
+    assert model.collar_id == "1"
+
+def test_collar_data_bad():
+    data = {"collarType": "A", "comID": "X", "comType": "Y", "key": "K"}
+    with pytest.raises(Exception):
+        CollarData.parse_obj(data)

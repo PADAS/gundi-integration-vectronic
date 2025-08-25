@@ -1,5 +1,6 @@
 import json
 import logging
+import pydantic
 
 import app.actions.client as client
 
@@ -11,14 +12,23 @@ from app.services.gundi import send_observations_to_gundi
 from app.services.state import IntegrationStateManager
 from app.services.utils import generate_batches
 
-from lxml import etree
-
 
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 
 VECTRONIC_BASE_URL = "https://api.vectronic-wildlife.com"
+
+
+class CollarData(pydantic.BaseModel):
+    collar_id: str = pydantic.Field(..., alias="collarID")
+    collar_type: str = pydantic.Field(..., alias="collarType")
+    com_id: str = pydantic.Field(..., alias="comID")
+    com_type: str = pydantic.Field(..., alias="comType")
+    key: str = pydantic.Field(..., alias="key")
+
+    class Config:
+        allow_population_by_field_name = True
 
 
 def transform(observation):
@@ -49,32 +59,36 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     collars_triggered = 0
 
     try:
-        # Decode the base64 content
+        # Turn string JSON into list of dicts
         collars = json.loads(action_config.files)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode collars JSON for integration ID {integration.id} and action_config {action_config}: {e}")
+        raise e
 
-        if not collars:
-            logger.warning(f"No valid collars found for integration ID {integration.id} and action_config {action_config}")
-            return {"status": "success", "collars_triggered": 0}
+    if not collars:
+        logger.warning(f"No valid collars found for integration ID {integration.id} and action_config {action_config}")
+        return {"status": "success", "collars_triggered": 0}
 
+    try:
         for collar in collars:
-            parsed_collar = client.CollarData.parse_obj(collar["parsedData"])
-            logger.info(f"Triggering 'action_fetch_collar_observations' action for collar {parsed_collar.collarID} to extract observations...")
+            parsed_collar = CollarData.parse_obj(collar["parsedData"])
+            logger.info(f"Triggering 'action_fetch_collar_observations' action for collar {parsed_collar.collar_id} to extract observations...")
             now = datetime.now(timezone.utc)
             device_state = await state_manager.get_state(
                 integration_id=integration.id,
                 action_id="pull_observations",
-                source_id=parsed_collar.collarID
+                source_id=parsed_collar.collar_id
             )
             if not device_state:
-                logger.info(f"Setting initial lookback hours for device {parsed_collar.collarID} to {action_config.default_lookback_hours}")
+                logger.info(f"Setting initial lookback hours for device {parsed_collar.collar_id} to {action_config.default_lookback_hours}")
                 start = (now - timedelta(hours=action_config.default_lookback_hours)).strftime("%Y-%m-%dT%H:%M:%S")
             else:
-                logger.info(f"Setting begin time for device {parsed_collar.collarID} to {device_state.get('updated_at')}")
+                logger.info(f"Setting begin time for device {parsed_collar.collar_id} to {device_state.get('updated_at')}")
                 start = device_state.get("updated_at")
 
             parsed_config = PullCollarObservationsConfig(
                 start=start,
-                collar_id=int(parsed_collar.collarID),
+                collar_id=int(parsed_collar.collar_id),
                 collar_key=parsed_collar.key
             )
             await trigger_action(integration.id, "fetch_collar_observations", config=parsed_config)
@@ -124,4 +138,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
     except (client.VectronicForbiddenException, client.VectronicNotFoundException) as e:
         message = f"Failed to authenticate with integration {integration.id} using {action_config}. Exception: {e}"
         logger.exception(message)
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to fetch observations for collar {action_config.collar_id} from integration ID {integration.id} and action_config {action_config}")
         raise e

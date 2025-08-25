@@ -11,14 +11,6 @@ logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 
-class CollarData(pydantic.BaseModel):
-    collarID: str
-    collarType: str
-    comID: str
-    comType: str
-    key: str
-
-
 class VectronicObservation(pydantic.BaseModel):
     idCollar: int
     acquisitionTime: datetime
@@ -65,7 +57,7 @@ class VectronicBadRequestException(Exception):
         super().__init__(f"'{self.status_code}: {self.message}, Error: {self.error}'")
 
 
-@stamina.retry(on=httpx.HTTPError, wait_initial=4.0, wait_jitter=5.0, wait_max=32.0)
+@stamina.retry(on=VectronicForbiddenException, wait_initial=4.0, wait_jitter=5.0, wait_max=32.0)
 async def get_observations(integration, base_url, config):
     async with httpx.AsyncClient(timeout=120) as session:
         logger.info(f"-- Getting observations for integration ID: {integration.id} Collar ID: {config.collar_id} --")
