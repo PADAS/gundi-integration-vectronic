@@ -1,5 +1,6 @@
 import pytest
 import json
+from app import settings
 from unittest.mock import AsyncMock, patch, MagicMock
 from app.actions.handlers import (
     action_pull_observations,
@@ -10,22 +11,28 @@ from app.actions.handlers import (
 from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
 
 @pytest.mark.asyncio
-@patch("app.actions.handlers.trigger_action", new_callable=AsyncMock)
-async def test_action_pull_observations_good(mocker, mock_publish_event, mock_state_manager):
-
+async def test_action_pull_observations_triggers_fetch_collar_observations(mocker, mock_publish_event, mock_state_manager):
     integration = MagicMock(id=1)
     files = json.dumps([
         {"parsedData": {"collarID": "1", "collarType": "A", "comID": "X", "comType": "Y", "key": "K"}}
     ])
     config = PullObservationsConfig(files=files, default_lookback_hours=12)
     mock_state_manager.get_state = AsyncMock(return_value=None)
+    settings.TRIGGER_ACTIONS_ALWAYS_SYNC = False
+    settings.INTEGRATION_COMMANDS_TOPIC = "vectronic-actions-topic"
+
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    mock_trigger_action = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
+
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.execute_action", return_value=None)
     result = await action_pull_observations(integration, config)
     assert result["status"] == "success"
     assert result["collars_triggered"] == 1
+    mock_trigger_action.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_action_pull_observations_bad_json(mocker, mock_publish_event, mock_state_manager):
