@@ -29,7 +29,10 @@ async def test_action_pull_observations_good(mocker, mock_publish_event, mock_st
 
 @pytest.mark.asyncio
 @patch("app.actions.handlers.state_manager")
-async def test_action_pull_observations_bad_json(mock_publish_event, mock_state_manager):
+async def test_action_pull_observations_bad_json(mocker, mock_publish_event, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     integration = MagicMock(id=1)
     config = PullObservationsConfig(files="not a json", default_lookback_hours=12)
     with pytest.raises(json.JSONDecodeError):
@@ -38,7 +41,10 @@ async def test_action_pull_observations_bad_json(mock_publish_event, mock_state_
 @pytest.mark.asyncio
 @patch("app.actions.handlers.state_manager")
 @patch("app.actions.handlers.trigger_action", new_callable=AsyncMock)
-async def test_action_pull_observations_empty_list(mock_publish_event, mock_state_manager):
+async def test_action_pull_observations_empty_list(mocker, mock_publish_event, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     integration = MagicMock(id=1)
     config = PullObservationsConfig(files="[]", default_lookback_hours=12)
     result = await action_pull_observations(integration, config)
