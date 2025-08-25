@@ -42,7 +42,7 @@ async def test_get_observations_empty_response(mock_get):
     integration = MagicMock(id=1)
     config = MagicMock(collar_id=1, collar_key="key", start=MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00"))
     result = await client.get_observations(integration, "http://test", config)
-    assert result == ""
+    assert result == []
 
 @pytest.mark.asyncio
 @patch("httpx.AsyncClient.get", new_callable=AsyncMock)

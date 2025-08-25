@@ -2,6 +2,7 @@ import pytest
 import json
 from app import settings
 from unittest.mock import AsyncMock, patch, MagicMock
+from app.actions.client import VectronicObservation
 from app.actions.handlers import (
     action_pull_observations,
     action_fetch_collar_observations,
@@ -77,18 +78,27 @@ async def test_action_fetch_collar_observations_exception(mock_get_obs):
         await action_fetch_collar_observations(integration, config)
 
 def test_transform_good():
-    class Obs:
-        idCollar = "1"
-        acquisitionTime = "2024-01-01T00:00:00"
-        latitude = 1.0
-        longitude = 2.0
-        foo = "bar"
-        def dict(self):
-            return self.__dict__
-    obs = Obs()
+    obj = {
+        "idCollar": "1",
+        "acquisitionTime": "2024-01-01T00:00:00",
+        "originCode": "A",
+        "ecefX": 100,
+        "ecefY": 200,
+        "ecefZ": 300,
+        "latitude": 1.0,
+        "longitude": 2.0,
+        "height": 10,
+        "dop": 1.5,
+        "mainVoltage": 3.7,
+        "backupVoltage": 3.6,
+        "temperature": 25.0,
+        "foo": "bar"  # extra field, will be ignored
+    }
+    obs = VectronicObservation.parse_obj(obj)
     result = transform(obs)
-    assert result["source_name"] == "1"
+    assert result["source_name"] == 1
     assert result["location"]["lat"] == 1.0
+    assert result["location"]["lon"] == 2.0
 
 def test_collar_data_good():
     data = {"collarID": "1", "collarType": "A", "comID": "X", "comType": "Y", "key": "K"}

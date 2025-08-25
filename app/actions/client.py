@@ -76,7 +76,8 @@ async def get_observations(integration, base_url, config):
             if parsed_response:
                 return [VectronicObservation.parse_obj(item) for item in parsed_response]
             else:
-                return response.text
+                logger.warning(f"-- No observations returned for integration ID: {integration.id} Collar ID: {config.collar_id}: {response.text}  --")
+                return []
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 403:
                 raise VectronicForbiddenException(e, "Unauthorized access")

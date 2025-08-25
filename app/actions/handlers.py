@@ -110,7 +110,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
 
     try:
         observations = await client.get_observations(integration, base_url, action_config)
-        if observations and isinstance(observations, list):
+        if observations:
             logger.info(f"Extracted {len(observations)} observations for collar {action_config.collar_id}")
 
             transformed_data = [transform(ob) for ob in observations]
@@ -133,7 +133,6 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
 
             return {"observations_extracted": observations_extracted}
         else:
-            logger.warning(f"No observations found for collar {action_config.collar_id}")
             return {"observations_extracted": 0}
     except (client.VectronicForbiddenException, client.VectronicNotFoundException) as e:
         message = f"Failed to authenticate with integration {integration.id} using {action_config}. Exception: {e}"
