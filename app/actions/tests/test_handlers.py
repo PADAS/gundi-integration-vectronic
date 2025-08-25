@@ -1,6 +1,7 @@
 import pytest
 import json
 from app import settings
+from pydantic import ValidationError
 from unittest.mock import AsyncMock, patch, MagicMock
 from app.actions.client import VectronicObservation
 from app.actions.handlers import (
@@ -77,7 +78,7 @@ async def test_action_fetch_collar_observations_exception(mock_get_obs):
     with pytest.raises(Exception):
         await action_fetch_collar_observations(integration, config)
 
-def test_transform_good():
+def test_transform_ok():
     obj = {
         "idCollar": "1",
         "acquisitionTime": "2024-01-01T00:00:00",
@@ -100,12 +101,13 @@ def test_transform_good():
     assert result["location"]["lat"] == 1.0
     assert result["location"]["lon"] == 2.0
 
-def test_collar_data_good():
+def test_collar_data_ok():
     data = {"collarID": "1", "collarType": "A", "comID": "X", "comType": "Y", "key": "K"}
     model = CollarData.parse_obj(data)
     assert model.collar_id == "1"
 
-def test_collar_data_bad():
+def test_collar_data_parsing_error():
     data = {"collarType": "A", "comID": "X", "comType": "Y", "key": "K"}
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError) as exc_info:
         CollarData.parse_obj(data)
+    assert "collarID" in str(exc_info.value)
