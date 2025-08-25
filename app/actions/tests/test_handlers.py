@@ -10,7 +10,6 @@ from app.actions.handlers import (
 from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
 
 @pytest.mark.asyncio
-@patch("app.actions.handlers.state_manager")
 @patch("app.actions.handlers.trigger_action", new_callable=AsyncMock)
 async def test_action_pull_observations_good(mocker, mock_publish_event, mock_state_manager):
 
@@ -20,6 +19,7 @@ async def test_action_pull_observations_good(mocker, mock_publish_event, mock_st
     ])
     config = PullObservationsConfig(files=files, default_lookback_hours=12)
     mock_state_manager.get_state = AsyncMock(return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
@@ -28,7 +28,6 @@ async def test_action_pull_observations_good(mocker, mock_publish_event, mock_st
     assert result["collars_triggered"] == 1
 
 @pytest.mark.asyncio
-@patch("app.actions.handlers.state_manager")
 async def test_action_pull_observations_bad_json(mocker, mock_publish_event, mock_state_manager):
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
@@ -39,8 +38,6 @@ async def test_action_pull_observations_bad_json(mocker, mock_publish_event, moc
         await action_pull_observations(integration, config)
 
 @pytest.mark.asyncio
-@patch("app.actions.handlers.state_manager")
-@patch("app.actions.handlers.trigger_action", new_callable=AsyncMock)
 async def test_action_pull_observations_empty_list(mocker, mock_publish_event, mock_state_manager):
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
@@ -50,24 +47,6 @@ async def test_action_pull_observations_empty_list(mocker, mock_publish_event, m
     result = await action_pull_observations(integration, config)
     assert result["status"] == "success"
     assert result["collars_triggered"] == 0
-
-@pytest.mark.asyncio
-@patch("app.actions.handlers.trigger_action", new_callable=AsyncMock)
-@patch("app.actions.handlers.state_manager")
-async def test_action_pull_observations_good(mock_state_manager, mock_trigger_action, mocker):
-    integration = MagicMock(id=1)
-    files = json.dumps([
-        {"parsedData": {"collarID": "1", "collarType": "A", "comID": "X", "comType": "Y", "key": "K"}}
-    ])
-    config = PullObservationsConfig(files=files, default_lookback_hours=12)
-    mock_state_manager.get_state = AsyncMock(return_value=None)
-    # Patch publish_event as needed
-    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
-    mocker.patch("app.services.action_runner.publish_event", new=AsyncMock())
-    mocker.patch("app.services.action_scheduler.publish_event", new=AsyncMock())
-    result = await action_pull_observations(integration, config)
-    assert result["status"] == "success"
-    assert result["collars_triggered"] == 1
 
 @pytest.mark.asyncio
 @patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
