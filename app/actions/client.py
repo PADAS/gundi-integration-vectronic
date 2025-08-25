@@ -1,7 +1,6 @@
 import logging
 import httpx
 import pydantic
-import stamina
 
 from datetime import datetime, timezone
 from app.services.state import IntegrationStateManager
@@ -57,9 +56,8 @@ class VectronicBadRequestException(Exception):
         super().__init__(f"'{self.status_code}: {self.message}, Error: {self.error}'")
 
 
-@stamina.retry(on=VectronicForbiddenException, wait_initial=4.0, wait_jitter=5.0, wait_max=32.0)
 async def get_observations(integration, base_url, config):
-    async with httpx.AsyncClient(timeout=120) as session:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0)) as session:
         logger.info(f"-- Getting observations for integration ID: {integration.id} Collar ID: {config.collar_id} --")
 
         url = f"{base_url}/v2/collar/{config.collar_id}/gps"
