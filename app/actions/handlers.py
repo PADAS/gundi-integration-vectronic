@@ -158,7 +158,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         )
         return {"observations_extracted": 0}
     except Exception as e:
-        message = f"Failed to fetch observations for collar {action_config.collar_id} from integration ID {integration.id} and action_config {action_config}. Exception: {e}"
+        message = f"Failed to fetch observations for collar {action_config.collar_id} from integration ID {integration.id}. Exception: {e}"
         logger.exception(message)
         await log_action_activity(
             integration_id=integration.id,
