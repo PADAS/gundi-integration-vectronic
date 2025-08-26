@@ -7,6 +7,9 @@ from app.services.errors import ConfigurationNotFound
 from app.services.utils import find_config_for_action, FieldWithUIOptions
 
 
+MAX_LOOKBACK_HOURS = 168  # 7 days
+
+
 class PullObservationsConfig(PullActionConfiguration):
     files: str = FieldWithUIOptions(
         title="JSON String of Collars",
@@ -17,7 +20,7 @@ class PullObservationsConfig(PullActionConfiguration):
         description="Number of hours to look back for observations (Max 168 hours = 7 days)",
         default=12,
         ge=1,
-        le=168,  # Limit to max 7 days
+        le=MAX_LOOKBACK_HOURS
     )
 
 
