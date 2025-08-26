@@ -2,7 +2,8 @@ import pytest
 import json
 from app import settings
 from pydantic import ValidationError
-from unittest.mock import AsyncMock, patch, MagicMock
+from gundi_core.schemas.v2 import LogLevel
+from unittest.mock import AsyncMock, MagicMock
 from app.actions.client import VectronicObservation
 from app.actions.handlers import (
     action_pull_observations,
@@ -70,7 +71,7 @@ async def test_action_fetch_collar_observations_no_observations(mocker):
     assert result["observations_extracted"] == 0
 
 @pytest.mark.asyncio
-async def test_action_fetch_collar_observations_exception_sends_warning_activity_log(mocker):
+async def test_action_fetch_collar_observations_exception_sends_error_activity_log(mocker):
     mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
@@ -80,6 +81,9 @@ async def test_action_fetch_collar_observations_exception_sends_warning_activity
     result = await action_fetch_collar_observations(integration, config)
     assert result == {"observations_extracted": 0}
     mock_log_action_activity.assert_awaited_once()
+    assert mock_log_action_activity.call_args[1]["integration_id"] == integration.id
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.ERROR
+    assert mock_log_action_activity.call_args[1]["title"] == f"Failed to fetch observations for collar {config.collar_id}."
 
 def test_transform_ok():
     obj = {
