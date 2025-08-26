@@ -64,7 +64,7 @@ async def get_observations(integration, base_url, config):
 
         params = {
             "collarkey": config.collar_key,
-            "afterScts": config.start.isoformat().split("+")[0]
+            "afterScts": config.start.strftime("%Y-%m-%dT%H:%M:%S")
         }
 
         try:

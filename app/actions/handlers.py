@@ -82,10 +82,10 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             )
             if not device_state:
                 logger.info(f"Setting initial lookback hours for device {parsed_collar.collar_id} to {action_config.default_lookback_hours}")
-                start = (now - timedelta(hours=action_config.default_lookback_hours)).strftime("%Y-%m-%dT%H:%M:%S")
+                start = now - timedelta(hours=action_config.default_lookback_hours)
             else:
                 logger.info(f"Setting begin time for device {parsed_collar.collar_id} to {device_state.get('updated_at')}")
-                start = device_state.get("updated_at")
+                start = datetime.fromisoformat(device_state.get("updated_at")).replace(tzinfo=timezone.utc)
 
             parsed_config = PullCollarObservationsConfig(
                 start=start,
