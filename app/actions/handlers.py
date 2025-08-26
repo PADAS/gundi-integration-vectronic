@@ -4,10 +4,11 @@ import pydantic
 
 import app.actions.client as client
 
+from gundi_core.schemas.v2 import LogLevel
 from datetime import datetime, timedelta, timezone
 from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
 from app.services.action_scheduler import trigger_action
-from app.services.activity_logger import activity_logger
+from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import send_observations_to_gundi
 from app.services.state import IntegrationStateManager
 from app.services.utils import generate_batches
@@ -134,10 +135,36 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             return {"observations_extracted": observations_extracted}
         else:
             return {"observations_extracted": 0}
-    except (client.VectronicForbiddenException, client.VectronicNotFoundException) as e:
-        message = f"Failed to authenticate with integration {integration.id} using {action_config}. Exception: {e}"
+    except client.VectronicForbiddenException as e:
+        message = f"Unauthorized response from Vectronic with integration {integration.id} using {action_config}. Exception: {e}"
         logger.exception(message)
-        raise e
+        await log_action_activity(
+            integration_id=integration.id,
+            action_id="pull_observations",
+            level=LogLevel.WARNING,
+            title="Unauthorized access (bad collar key and/or collar ID)",
+            data={"message": message, "data": action_config}
+        )
+        return {"observations_extracted": 0}
+    except client.VectronicNotFoundException as e:
+        message = f"Collar ID {action_config.collar_id} not found. Integration {integration.id} using {action_config}. Exception: {e}"
+        logger.exception(message)
+        await log_action_activity(
+            integration_id=integration.id,
+            action_id="pull_observations",
+            level=LogLevel.WARNING,
+            title=f"Collar ID {action_config.collar_id} not found.",
+            data={"message": message}
+        )
+        return {"observations_extracted": 0}
     except Exception as e:
-        logger.error(f"Failed to fetch observations for collar {action_config.collar_id} from integration ID {integration.id} and action_config {action_config}")
-        raise e
+        message = f"Failed to fetch observations for collar {action_config.collar_id} from integration ID {integration.id} and action_config {action_config}. Exception: {e}"
+        logger.exception(message)
+        await log_action_activity(
+            integration_id=integration.id,
+            action_id="pull_observations",
+            level=LogLevel.WARNING,
+            title=f"Failed to fetch observations for collar {action_config.collar_id}.",
+            data={"message": message}
+        )
+        return {"observations_extracted": 0}
