@@ -141,7 +141,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         await log_action_activity(
             integration_id=integration.id,
             action_id="pull_observations",
-            level=LogLevel.WARNING,
+            level=LogLevel.ERROR,
             title="Unauthorized access (bad collar key and/or collar ID)",
             data={"message": message, "data": action_config}
         )
@@ -152,9 +152,9 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         await log_action_activity(
             integration_id=integration.id,
             action_id="pull_observations",
-            level=LogLevel.WARNING,
+            level=LogLevel.ERROR,
             title=f"Collar ID {action_config.collar_id} not found.",
-            data={"message": message}
+            data={"message": message, "data": action_config}
         )
         return {"observations_extracted": 0}
     except Exception as e:
@@ -163,8 +163,8 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         await log_action_activity(
             integration_id=integration.id,
             action_id="pull_observations",
-            level=LogLevel.WARNING,
+            level=LogLevel.ERROR,
             title=f"Failed to fetch observations for collar {action_config.collar_id}.",
-            data={"message": message}
+            data={"message": message, "data": action_config}
         )
         return {"observations_extracted": 0}
