@@ -72,9 +72,12 @@ async def test_action_fetch_collar_observations_no_observations(mock_get_obs, mo
 @pytest.mark.asyncio
 @patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
 @patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
-async def test_action_fetch_collar_observations_exception_sends_warning_activity_log(mock_get_obs, mock_log_action_activity):
+async def test_action_fetch_collar_observations_exception_sends_warning_activity_log(
+        mock_get_obs, mock_log_action_activity, mocker, mock_publish_event
+):
     integration = MagicMock(id=1, base_url=None)
     config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mock_get_obs.side_effect = Exception("fail")
     result = await action_fetch_collar_observations(integration, config)
     assert result == {"observations_extracted": 0}
