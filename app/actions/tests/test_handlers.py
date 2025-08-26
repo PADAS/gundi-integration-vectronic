@@ -70,13 +70,18 @@ async def test_action_fetch_collar_observations_no_observations(mock_get_obs, mo
     assert result["observations_extracted"] == 0
 
 @pytest.mark.asyncio
+@patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
 @patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
-async def test_action_fetch_collar_observations_exception(mock_get_obs):
+async def test_action_fetch_collar_observations_exception_sends_warning_activity_log(mock_get_obs, mock_log_action_activity):
     integration = MagicMock(id=1, base_url=None)
     config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
     mock_get_obs.side_effect = Exception("fail")
-    with pytest.raises(Exception):
-        await action_fetch_collar_observations(integration, config)
+    result = await action_fetch_collar_observations(integration, config)
+    assert result == {"observations_extracted": 0}
+    mock_log_action_activity.assert_awaited_once()
+    assert "Failed to fetch observations for collar 1 from integration ID 1" in mock_log_action_activity.call_args[1]["data"]["message"]
+    assert "Exception: fail" in mock_log_action_activity.call_args[1]["data"]["message"]
+
 
 def test_transform_ok():
     obj = {
