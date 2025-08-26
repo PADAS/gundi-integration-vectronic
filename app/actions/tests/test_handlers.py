@@ -58,8 +58,8 @@ async def test_action_pull_observations_empty_list(mocker, mock_publish_event, m
     assert result["collars_triggered"] == 0
 
 @pytest.mark.asyncio
-@patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
-async def test_action_fetch_collar_observations_no_observations(mock_get_obs, mocker):
+async def test_action_fetch_collar_observations_no_observations(mocker):
+    mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.services.action_runner.publish_event", new=AsyncMock())
     mocker.patch("app.services.action_scheduler.publish_event", new=AsyncMock())
@@ -70,14 +70,12 @@ async def test_action_fetch_collar_observations_no_observations(mock_get_obs, mo
     assert result["observations_extracted"] == 0
 
 @pytest.mark.asyncio
-@patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
-@patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
-async def test_action_fetch_collar_observations_exception_sends_warning_activity_log(
-        mock_get_obs, mock_log_action_activity, mocker, mock_publish_event
-):
+async def test_action_fetch_collar_observations_exception_sends_warning_activity_log(mocker):
+    mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
     config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
-    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mock_get_obs.side_effect = Exception("fail")
     result = await action_fetch_collar_observations(integration, config)
     assert result == {"observations_extracted": 0}
