@@ -116,7 +116,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             logger.info(f"Extracted {len(observations)} observations for collar {action_config.collar_id}")
 
             for ob in observations:
-                if not ob.latitude or not ob.longitude:
+                if ob.latitude is None or ob.longitude is None:
                     message = f"Collar ID {ob.id_collar} got an invalid observation (location is invalid). Skipping..."
                     logger.warning(message)
                     await log_action_activity(
