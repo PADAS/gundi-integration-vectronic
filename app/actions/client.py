@@ -3,6 +3,7 @@ import httpx
 import pydantic
 
 from datetime import datetime, timezone
+from typing import Optional
 from app.services.state import IntegrationStateManager
 
 
@@ -11,21 +12,24 @@ state_manager = IntegrationStateManager()
 
 
 class VectronicObservation(pydantic.BaseModel):
-    idCollar: int
-    acquisitionTime: datetime
-    originCode: str
-    ecefX: int
-    ecefY: int
-    ecefZ: int
-    latitude: float
-    longitude: float
-    height: int
-    dop: float
-    mainVoltage: float
-    backupVoltage: float
-    temperature: float
+    id_collar: int = pydantic.Field(..., alias="idCollar")
+    acquisition_time: datetime = pydantic.Field(..., alias="acquisitionTime")
+    origin_code: Optional[str] = pydantic.Field(None, alias="originCode")
+    ecef_x: Optional[int] = pydantic.Field(None, alias="ecefX")
+    ecef_y: Optional[int] = pydantic.Field(None, alias="ecefY")
+    ecef_z: Optional[int] = pydantic.Field(None, alias="ecefZ")
+    latitude: Optional[float] = pydantic.Field(None, alias="latitude")
+    longitude: Optional[float] = pydantic.Field(None, alias="longitude")
+    height: Optional[int] = pydantic.Field(None, alias="height")
+    dop: Optional[float] = pydantic.Field(None, alias="dop")
+    main_voltage: Optional[float] = pydantic.Field(None, alias="mainVoltage")
+    backup_voltage: Optional[float] = pydantic.Field(None, alias="backupVoltage")
+    temperature: Optional[float] = pydantic.Field(None, alias="temperature")
 
-    @pydantic.validator('acquisitionTime', always=True)
+    class Config:
+        allow_population_by_field_name = True
+
+    @pydantic.validator('acquisition_time', always=True)
     def parse_time_string(cls, v):
         if not v.tzinfo:
             return v.replace(tzinfo=timezone.utc)

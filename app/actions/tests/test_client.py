@@ -27,7 +27,7 @@ async def test_get_observations_success(mock_get):
     config = MagicMock(collar_id=1, collar_key="key", start=MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00"))
     result = await client.get_observations(integration, "http://test", config)
     assert isinstance(result, list)
-    assert result[0].idCollar == 1
+    assert result[0].id_collar == 1
 
 @pytest.mark.asyncio
 @patch("httpx.AsyncClient.get", new_callable=AsyncMock)

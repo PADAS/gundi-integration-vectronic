@@ -34,15 +34,15 @@ class CollarData(pydantic.BaseModel):
 
 def transform(observation):
     additional_info = {
-        key: value for key, value in observation.dict().items() if value and key not in ["idCollar", "acquisitionTime", "latitude", "longitude"]
+        key: value for key, value in observation.dict().items() if value and key not in ["id_collar", "acquisition_time", "latitude", "longitude"]
     }
 
     return {
-        "source_name": observation.idCollar,
-        "source": observation.idCollar,
+        "source_name": observation.id_collar,
+        "source": observation.id_collar,
         "type": "tracking-device",
         "subject_type": "wildlife",
-        "recorded_at": observation.acquisitionTime,
+        "recorded_at": observation.acquisition_time,
         "location": {
             "lat": observation.latitude,
             "lon": observation.longitude
@@ -107,6 +107,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
     logger.info(f"Executing 'fetch_collar_observations' action with integration ID {integration.id} and action_config {action_config}...")
 
     base_url = integration.base_url or VECTRONIC_BASE_URL
+    transformed_data = []
     observations_extracted = 0
 
     try:
@@ -114,7 +115,19 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         if observations:
             logger.info(f"Extracted {len(observations)} observations for collar {action_config.collar_id}")
 
-            transformed_data = [transform(ob) for ob in observations]
+            for ob in observations:
+                if not ob.latitude or not ob.longitude:
+                    message = f"Collar ID {ob.id_collar} got an invalid observation (location is invalid). Skipping..."
+                    logger.warning(message)
+                    await log_action_activity(
+                        integration_id=integration.id,
+                        action_id="fetch_collar_observations",
+                        level=LogLevel.WARNING,
+                        title=message,
+                        data={"observation": ob.dict()}
+                    )
+                    continue
+                transformed_data.append(transform(ob))
 
             for i, batch in enumerate(generate_batches(transformed_data, 200)):
                 logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Collar: {action_config.collar_id}')
@@ -122,7 +135,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
                 observations_extracted += len(response)
 
             # Save latest device updated_at
-            latest_time = max(observations, key=lambda obs: obs.acquisitionTime).acquisitionTime
+            latest_time = max(observations, key=lambda obs: obs.acquisition_time).acquisition_time
             state = {"updated_at": latest_time.strftime("%Y-%m-%dT%H:%M:%S")}
 
             await state_manager.set_state(
