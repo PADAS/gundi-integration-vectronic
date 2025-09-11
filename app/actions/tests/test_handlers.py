@@ -88,6 +88,10 @@ async def test_action_fetch_collar_observations_skips_invalid_location(mocker, c
     invalid_ob.acquisition_time = "2024-01-01T00:00:00Z"
     invalid_ob.dict.return_value = {"latitude": None, "longitude": 10.0}
 
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.services.action_runner.publish_event", new=AsyncMock())
+    mocker.patch("app.services.action_scheduler.publish_event", new=AsyncMock())
+
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
     mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[invalid_ob]))
 
