@@ -129,21 +129,22 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
                     continue
                 transformed_data.append(transform(ob))
 
-            for i, batch in enumerate(generate_batches(transformed_data, 200)):
-                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Collar: {action_config.collar_id}')
-                response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
-                observations_extracted += len(response)
+            if transformed_data:
+                for i, batch in enumerate(generate_batches(transformed_data, 200)):
+                    logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Collar: {action_config.collar_id}')
+                    response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
+                    observations_extracted += len(response)
 
-            # Save latest device updated_at
-            latest_time = max(observations, key=lambda obs: obs.acquisition_time).acquisition_time
-            state = {"updated_at": latest_time.strftime("%Y-%m-%dT%H:%M:%S")}
+                # Save latest device updated_at
+                latest_time = max(observations, key=lambda obs: obs.acquisition_time).acquisition_time
+                state = {"updated_at": latest_time.strftime("%Y-%m-%dT%H:%M:%S")}
 
-            await state_manager.set_state(
-                integration_id=integration.id,
-                action_id="pull_observations",
-                state=state,
-                source_id=str(action_config.collar_id)
-            )
+                await state_manager.set_state(
+                    integration_id=integration.id,
+                    action_id="pull_observations",
+                    state=state,
+                    source_id=str(action_config.collar_id)
+                )
 
             return {"observations_extracted": observations_extracted}
         else:

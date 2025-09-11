@@ -71,6 +71,38 @@ async def test_action_fetch_collar_observations_no_observations(mocker):
     assert result["observations_extracted"] == 0
 
 @pytest.mark.asyncio
+async def test_action_fetch_collar_observations_skips_invalid_location(mocker, caplog):
+    # Mock integration and action_config
+    integration = MagicMock()
+    integration.id = 1
+    integration.base_url = None
+
+    action_config = MagicMock()
+    action_config.collar_id = 123
+
+    # Mock observation with invalid latitude/longitude
+    invalid_ob = MagicMock()
+    invalid_ob.latitude = None
+    invalid_ob.longitude = 10.0
+    invalid_ob.id_collar = "test_collar"
+    invalid_ob.acquisition_time = "2024-01-01T00:00:00Z"
+    invalid_ob.dict.return_value = {"latitude": None, "longitude": 10.0}
+
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[invalid_ob]))
+
+    result = await action_fetch_collar_observations(integration, action_config)
+
+    # Assert warning was logged and no observations extracted
+    assert "invalid observation" in caplog.text
+    assert result["observations_extracted"] == 0
+
+    mock_log_action_activity.assert_awaited_once()
+    assert mock_log_action_activity.call_args[1]["integration_id"] == integration.id
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.WARNING
+    assert mock_log_action_activity.call_args[1]["title"] == f"Collar ID {invalid_ob.id_collar} got an invalid observation (location is invalid). Skipping..."
+
+@pytest.mark.asyncio
 async def test_action_fetch_collar_observations_exception_sends_error_activity_log(mocker):
     mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
