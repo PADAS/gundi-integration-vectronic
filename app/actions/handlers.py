@@ -155,7 +155,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         await log_action_activity(
             integration_id=integration.id,
             action_id="pull_observations",
-            level=LogLevel.ERROR,
+            level=LogLevel.WARNING,
             title="Unauthorized access (bad collar key and/or collar ID)",
             data={"message": message, "data": action_config}
         )
