@@ -1,5 +1,6 @@
 import json
 import logging
+import httpx
 import pydantic
 
 import app.actions.client as client
@@ -151,23 +152,37 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             return {"observations_extracted": 0}
     except client.VectronicForbiddenException as e:
         message = f"Unauthorized response from Vectronic with integration {integration.id} using {action_config}. Exception: {e}"
-        logger.exception(message)
+        logger.warning(message)
         await log_action_activity(
             integration_id=integration.id,
-            action_id="pull_observations",
-            level=LogLevel.ERROR,
+            action_id="fetch_collar_observations",
+            level=LogLevel.WARNING,
             title="Unauthorized access (bad collar key and/or collar ID)",
             data={"message": message, "data": action_config}
         )
         return {"observations_extracted": 0}
     except client.VectronicNotFoundException as e:
         message = f"Collar ID {action_config.collar_id} not found. Integration {integration.id} using {action_config}. Exception: {e}"
-        logger.exception(message)
+        logger.warning(message)
         await log_action_activity(
             integration_id=integration.id,
-            action_id="pull_observations",
-            level=LogLevel.ERROR,
+            action_id="fetch_collar_observations",
+            level=LogLevel.WARNING,
             title=f"Collar ID {action_config.collar_id} not found.",
+            data={"message": message, "data": action_config}
+        )
+        return {"observations_extracted": 0}
+    except httpx.HTTPStatusError as e:
+        # Other 4xx/5xx responses from the collar API (403/404 are handled above).
+        # These are upstream/transient conditions, not integration errors, so log as a warning.
+        status_code = e.response.status_code
+        message = f"Vectronic returned HTTP {status_code} for collar {action_config.collar_id} from integration ID {integration.id}. Exception: {e}"
+        logger.warning(message)
+        await log_action_activity(
+            integration_id=integration.id,
+            action_id="fetch_collar_observations",
+            level=LogLevel.WARNING,
+            title=f"Vectronic returned HTTP {status_code} for collar {action_config.collar_id}.",
             data={"message": message, "data": action_config}
         )
         return {"observations_extracted": 0}
@@ -176,7 +191,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         logger.exception(message)
         await log_action_activity(
             integration_id=integration.id,
-            action_id="pull_observations",
+            action_id="fetch_collar_observations",
             level=LogLevel.ERROR,
             title=f"Failed to fetch observations for collar {action_config.collar_id}.",
             data={"message": message, "data": action_config}

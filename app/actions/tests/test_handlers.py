@@ -1,10 +1,15 @@
 import pytest
 import json
+import httpx
 from app import settings
 from pydantic import ValidationError
 from gundi_core.schemas.v2 import LogLevel
 from unittest.mock import AsyncMock, MagicMock
-from app.actions.client import VectronicObservation
+from app.actions.client import (
+    VectronicObservation,
+    VectronicForbiddenException,
+    VectronicNotFoundException,
+)
 from app.actions.handlers import (
     action_pull_observations,
     action_fetch_collar_observations,
@@ -118,8 +123,53 @@ async def test_action_fetch_collar_observations_exception_sends_error_activity_l
     assert result == {"observations_extracted": 0}
     mock_log_action_activity.assert_awaited_once()
     assert mock_log_action_activity.call_args[1]["integration_id"] == integration.id
+    assert mock_log_action_activity.call_args[1]["action_id"] == "fetch_collar_observations"
     assert mock_log_action_activity.call_args[1]["level"] == LogLevel.ERROR
     assert mock_log_action_activity.call_args[1]["title"] == f"Failed to fetch observations for collar {config.collar_id}."
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_forbidden_logs_warning(mocker):
+    mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    mock_get_obs.side_effect = VectronicForbiddenException(Exception("403"), "Unauthorized access")
+    result = await action_fetch_collar_observations(integration, config)
+    assert result == {"observations_extracted": 0}
+    mock_log_action_activity.assert_awaited_once()
+    assert mock_log_action_activity.call_args[1]["action_id"] == "fetch_collar_observations"
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.WARNING
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_not_found_logs_warning(mocker):
+    mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    mock_get_obs.side_effect = VectronicNotFoundException(Exception("404"), "Not found")
+    result = await action_fetch_collar_observations(integration, config)
+    assert result == {"observations_extracted": 0}
+    mock_log_action_activity.assert_awaited_once()
+    assert mock_log_action_activity.call_args[1]["action_id"] == "fetch_collar_observations"
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.WARNING
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_http_status_error_logs_warning(mocker):
+    mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    request = httpx.Request("GET", "https://api.vectronic-wildlife.com/v2/collar/1/gps")
+    response = httpx.Response(status_code=500, request=request, text="Internal Server Error")
+    mock_get_obs.side_effect = httpx.HTTPStatusError("Server error", request=request, response=response)
+    result = await action_fetch_collar_observations(integration, config)
+    assert result == {"observations_extracted": 0}
+    mock_log_action_activity.assert_awaited_once()
+    assert mock_log_action_activity.call_args[1]["action_id"] == "fetch_collar_observations"
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.WARNING
 
 def test_transform_ok():
     obj = {
