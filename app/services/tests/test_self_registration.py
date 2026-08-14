@@ -37,6 +37,16 @@ async def test_register_integration_with_slug_setting(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured schedule. "
+                                    "Turn it off to pause scheduled execution for this integration without deleting "
+                                    "the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -151,6 +161,16 @@ async def test_register_integration_with_slug_arg(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured schedule. "
+                                    "Turn it off to pause scheduled execution for this integration without deleting "
+                                    "the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -266,6 +286,16 @@ async def test_register_integration_with_service_url_arg(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured schedule. "
+                                    "Turn it off to pause scheduled execution for this integration without deleting "
+                                    "the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -384,6 +414,16 @@ async def test_register_integration_with_service_url_setting(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured schedule. "
+                                    "Turn it off to pause scheduled execution for this integration without deleting "
+                                    "the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
