@@ -33,14 +33,21 @@ async def test_action_pull_observations_triggers_fetch_collar_observations(mocke
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
 
-    mock_trigger_action = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
+    mock_trigger_actions = mocker.patch("app.actions.handlers.trigger_actions", return_value=None)
 
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.execute_action", return_value=None)
     result = await action_pull_observations(integration, config)
     assert result["status"] == "success"
     assert result["collars_triggered"] == 1
-    mock_trigger_action.assert_called_once()
+    # One batched publish for every collar, not one PubSub round trip per
+    # collar: the 133-collar integrations overran Cloud Run's request timeout.
+    mock_trigger_actions.assert_called_once()
+    args, kwargs = mock_trigger_actions.call_args
+    assert kwargs["action_id"] == "fetch_collar_observations"
+    configs = kwargs["configs"]
+    assert [c.collar_id for c in configs] == [1]
+    assert configs[0].collar_key == "K"
 
 @pytest.mark.asyncio
 async def test_action_pull_observations_bad_json(mocker, mock_publish_event, mock_state_manager):

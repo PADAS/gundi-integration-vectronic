@@ -8,7 +8,7 @@ import app.actions.client as client
 from gundi_core.schemas.v2 import LogLevel
 from datetime import datetime, timedelta, timezone
 from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
-from app.services.action_scheduler import trigger_action
+from app.services.action_scheduler import trigger_actions
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import send_observations_to_gundi
 from app.services.state import IntegrationStateManager
@@ -72,6 +72,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         return {"status": "success", "collars_triggered": 0}
 
     try:
+        collar_configs = []
         for collar in collars:
             parsed_collar = CollarData.parse_obj(collar["parsedData"])
             logger.info(f"Triggering 'action_fetch_collar_observations' action for collar {parsed_collar.collar_id} to extract observations...")
@@ -88,13 +89,20 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 logger.info(f"Setting begin time for device {parsed_collar.collar_id} to {device_state.get('updated_at')}")
                 start = datetime.fromisoformat(device_state.get("updated_at")).replace(tzinfo=timezone.utc)
 
-            parsed_config = PullCollarObservationsConfig(
+            collar_configs.append(PullCollarObservationsConfig(
                 start=start,
                 collar_id=int(parsed_collar.collar_id),
                 collar_key=parsed_collar.key
-            )
-            await trigger_action(integration.id, "fetch_collar_observations", config=parsed_config)
-            collars_triggered += 1
+            ))
+        # One batched publish for the whole list: one PubSub round trip per
+        # collar (each with its own session and token) overran Cloud Run's
+        # request timeout for the 100+ collar integrations.
+        await trigger_actions(
+            integration_id=integration.id,
+            action_id="fetch_collar_observations",
+            configs=collar_configs,
+        )
+        collars_triggered = len(collar_configs)
 
     except Exception as e:
         logger.error(f"Failed to process collars from integration ID {integration.id} and action_config {action_config}")
