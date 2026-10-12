@@ -226,9 +226,11 @@ async def save_cursor(integration_id, collar_id: int, cursor: datetime):
     )
 
 
-# No "started" event: this runs once per collar per schedule tick, and a
-# start/complete pair per collar flooded the activity log for large integrations.
-@activity_logger(on_start=False)
+# No "started" or generic "completed" event: this runs once per collar per
+# schedule tick, and an entry per collar per run flooded the activity log for
+# large integrations. A run that sends observations logs its own entry naming
+# the collar; failures still log through on_error and the warnings below.
+@activity_logger(on_start=False, on_completion=False)
 async def action_fetch_collar_observations(integration, action_config: PullCollarObservationsConfig):
     logger.info(f"Executing 'fetch_collar_observations' action with integration ID {integration.id} and action_config {action_config}...")
 
@@ -309,6 +311,25 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             except Exception as log_error:
                 logger.warning(
                     f"Could not publish the invalid-observation summary for collar {action_config.collar_id} "
+                    f"(integration '{integration.id}'): {log_error}"
+                )
+
+        if observations_extracted:
+            # Best-effort, like the summary above: the data is already in Gundi.
+            try:
+                await log_action_activity(
+                    integration_id=integration.id,
+                    action_id="fetch_collar_observations",
+                    level=LogLevel.INFO,
+                    title=f"Collar ID {action_config.collar_id}: sent {observations_extracted} observation(s) to Gundi.",
+                    data={
+                        "collar_id": action_config.collar_id,
+                        "observations_extracted": observations_extracted,
+                    }
+                )
+            except Exception as log_error:
+                logger.warning(
+                    f"Could not publish the completion entry for collar {action_config.collar_id} "
                     f"(integration '{integration.id}'): {log_error}"
                 )
 
