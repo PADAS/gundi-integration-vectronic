@@ -11,9 +11,14 @@ MAX_LOOKBACK_HOURS = 168  # 7 days
 
 
 class PullObservationsConfig(PullActionConfiguration):
+    # Holds every collar's key. Excluded from .dict() and repr so it stays out
+    # of activity events (the decorator publishes action_config.dict()) and
+    # log lines; the portal form schema is unaffected.
     files: str = FieldWithUIOptions(
         title="JSON String of Collars",
         description="A JSON string representing a list of collars to be processed",
+        exclude=True,
+        repr=False,
     )
     default_lookback_hours: int = FieldWithUIOptions(
         title="Data Retrieval Period (Hours)",

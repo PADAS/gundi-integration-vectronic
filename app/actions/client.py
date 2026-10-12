@@ -10,15 +10,21 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+_COLLAR_KEY_PATTERN = re.compile(r"(collarkey=)[^&\s\"']+", re.IGNORECASE)
+
+
+def redact_collar_key(text: str) -> str:
+    return _COLLAR_KEY_PATTERN.sub(r"\1<redacted>", text)
+
+
 class _RedactCollarKey(logging.Filter):
     """httpx logs every request URL at INFO, and Vectronic takes the collar key
     as a query parameter, so mask it before the record reaches any handler."""
-    _pattern = re.compile(r"(collarkey=)[^&\s\"']+", re.IGNORECASE)
 
     def filter(self, record):
         message = record.getMessage()
         if "collarkey=" in message.lower():
-            record.msg = self._pattern.sub(r"\1<redacted>", message)
+            record.msg = redact_collar_key(message)
             record.args = ()
         return True
 
@@ -105,8 +111,12 @@ async def get_observations(base_url: str, collar_id: int, collar_key: str, after
                 logger.warning(f"-- No observations returned for Collar ID: {collar_id}: {response.text}  --")
                 return []
         except httpx.HTTPStatusError as e:
+            # The message embeds the request URL, collar key included, and
+            # callers log it. Re-raise with the key masked and without the
+            # original in the exception chain.
+            safe_error = httpx.HTTPStatusError(redact_collar_key(str(e)), request=e.request, response=e.response)
             if e.response.status_code == 403:
-                raise VectronicForbiddenException(e, "Unauthorized access")
+                raise VectronicForbiddenException(safe_error, "Unauthorized access") from None
             elif e.response.status_code == 404:
-                raise VectronicNotFoundException(e, "Not found")
-            raise e
+                raise VectronicNotFoundException(safe_error, "Not found") from None
+            raise safe_error from None

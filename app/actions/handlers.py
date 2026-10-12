@@ -208,6 +208,13 @@ async def get_saved_cursor(integration_id, collar_id: int) -> Optional[datetime]
 
 
 async def save_cursor(integration_id, collar_id: int, cursor: datetime):
+    # Redeliveries of one collar's message can run concurrently. Never write a
+    # cursor older than the saved one, so a slower run cannot rewind a faster
+    # one. This is a read-then-write, not atomic; a lost race only replays
+    # already-sent batches, it does not skip any.
+    saved_cursor = await get_saved_cursor(integration_id, collar_id)
+    if saved_cursor and saved_cursor >= cursor:
+        return
     await state_manager.set_state(
         integration_id=integration_id,
         action_id="pull_observations",
@@ -250,7 +257,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         # inclusive, fixes received at exactly the cursor come back on every
         # run, so drop anything at or before it.
         observations = sorted(
-            (ob for ob in observations if ob.scts is None or ob.scts > start),
+            (ob for ob in observations if receive_time(ob) > start),
             key=receive_time,
         )
         if not observations:

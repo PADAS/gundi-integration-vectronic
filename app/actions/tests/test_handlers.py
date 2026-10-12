@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timezone
 import json
 import httpx
 from app import settings
@@ -110,7 +111,7 @@ async def test_action_fetch_collar_observations_summarizes_invalid_locations(moc
     config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
     invalid_obs = [
         make_observation(f"2024-01-01T0{i}:00:00", latitude=None, longitude=None)
-        for i in range(5)
+        for i in range(1, 6)
     ]
     mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
     mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", new_callable=AsyncMock)
@@ -159,19 +160,22 @@ async def test_action_fetch_collar_observations_advances_cursor_when_all_invalid
 
 @pytest.mark.asyncio
 async def test_action_fetch_collar_observations_cursor_never_moves_backward(mocker, mock_state_manager):
-    # A late-uploaded fix passes the afterScts filter but has an acquisition
-    # time older than the current cursor; keeping it would widen the next query.
+    # A fix whose receive time (here, acquisition time, since scts is missing)
+    # is older than the start is dropped, so it can neither be re-reported nor
+    # pull the cursor back.
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
     config = PullCollarObservationsConfig(start="2026-10-12T00:00:00", collar_id=123)
     late_ob = make_observation("2022-09-26T16:01:39", latitude=None, longitude=None)
     mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
-    mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
     mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[late_ob]))
 
-    await action_fetch_collar_observations(integration, config)
+    result = await action_fetch_collar_observations(integration, config)
 
-    assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2026-10-12T00:00:00"}
+    assert result == {"observations_extracted": 0}
+    mock_state_manager.set_state.assert_not_called()
+    mock_log_action_activity.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -541,6 +545,44 @@ def test_pull_collar_observations_config_ignores_legacy_collar_key():
     )
     assert "collar_key" not in config.dict()
     assert "LEGACY" not in repr(config)
+
+
+@pytest.mark.asyncio
+async def test_save_cursor_does_not_rewind_a_newer_saved_cursor(mocker, mock_state_manager):
+    # A faster concurrent run already saved t10; this slower run reaches t4.
+    from app.actions.handlers import save_cursor
+    mock_state_manager.get_state.return_value = async_return({"updated_at": "2024-01-10T00:00:00"})
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+
+    await save_cursor(1, 123, datetime(2024, 1, 4, tzinfo=timezone.utc))
+
+    mock_state_manager.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_drops_fixes_without_scts_at_or_before_cursor(mocker, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    old_ob = make_observation("2024-01-01T00:00:00", latitude=None)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[old_ob]))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
+
+    result = await action_fetch_collar_observations(integration, config)
+
+    assert result == {"observations_extracted": 0}
+    mock_log_action_activity.assert_not_awaited()
+
+
+def test_pull_observations_config_keeps_collar_keys_out_of_events_and_repr():
+    files = json.dumps([{"parsedData": {"collarID": "1", "collarType": "A", "comID": "X", "comType": "Y", "key": "SECRETKEY123"}}])
+    config = PullObservationsConfig(files=files, default_lookback_hours=12)
+    assert "files" not in config.dict()
+    assert "SECRETKEY123" not in repr(config)
+    assert config.files == files
+    # The portal still renders the field.
+    assert "files" in PullObservationsConfig.schema()["properties"]
 
 
 def test_transform_ok():
