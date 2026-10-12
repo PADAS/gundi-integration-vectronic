@@ -83,10 +83,11 @@ async def test_action_fetch_collar_observations_no_observations(mocker):
     result = await action_fetch_collar_observations(integration, config)
     assert result["observations_extracted"] == 0
 
-def make_observation(acquisition_time, latitude=1.0, longitude=2.0, collar_id=123):
+def make_observation(acquisition_time, latitude=1.0, longitude=2.0, collar_id=123, scts=None):
     return VectronicObservation(
         id_collar=collar_id,
         acquisition_time=acquisition_time,
+        scts=scts,
         latitude=latitude,
         longitude=longitude,
     )
@@ -161,6 +162,26 @@ async def test_action_fetch_collar_observations_cursor_never_moves_backward(mock
     await action_fetch_collar_observations(integration, config)
 
     assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2026-10-12T00:00:00"}
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_cursor_tracks_receive_time(mocker, mock_state_manager):
+    # Fixes acquired in 2020 but received recently pass afterScts=start; the
+    # cursor must move past their receive time or every run re-fetches them.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2026-10-12T00:00:00", collar_id=37590, collar_key="K")
+    late_obs = [
+        make_observation("2020-07-22T13:01:39", latitude=None, longitude=None, scts="2026-10-12T03:10:00"),
+        make_observation("2020-07-22T14:01:39", latitude=None, longitude=None, scts="2026-10-12T03:15:27"),
+    ]
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=late_obs))
+
+    await action_fetch_collar_observations(integration, config)
+
+    assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2026-10-12T03:15:27"}
 
 
 @pytest.mark.asyncio
@@ -404,6 +425,17 @@ def test_transform_ok():
     assert result["source_name"] == 1
     assert result["location"]["lat"] == 1.0
     assert result["location"]["lon"] == 2.0
+
+
+def test_transform_excludes_scts_from_additional():
+    obs = VectronicObservation.parse_obj({
+        "idCollar": 1,
+        "acquisitionTime": "2024-01-01T00:00:00",
+        "scts": "2024-01-01T00:05:00",
+        "latitude": 1.0,
+        "longitude": 2.0,
+    })
+    assert "scts" not in transform(obs)["additional"]
 
 def test_collar_data_ok():
     data = {"collarID": "1", "collarType": "A", "comID": "X", "comType": "Y", "key": "K"}

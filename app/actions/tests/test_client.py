@@ -91,3 +91,17 @@ async def test_get_observations_other_http_error(mock_get):
     config = MagicMock(collar_id=1, collar_key="key", start=MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00"))
     with pytest.raises(httpx.HTTPStatusError):
         await client.get_observations(integration, "http://test", config)
+
+
+def test_observation_parses_scts_as_utc():
+    ob = client.VectronicObservation.parse_obj({
+        "idCollar": 37590,
+        "acquisitionTime": "2020-07-22T13:01:39",
+        "scts": "2026-10-12T03:15:27",
+    })
+    assert ob.scts.isoformat() == "2026-10-12T03:15:27+00:00"
+
+
+def test_observation_scts_is_optional():
+    ob = client.VectronicObservation.parse_obj({"idCollar": 1, "acquisitionTime": "2024-01-01T00:00:00"})
+    assert ob.scts is None

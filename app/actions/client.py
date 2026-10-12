@@ -14,6 +14,9 @@ state_manager = IntegrationStateManager()
 class VectronicObservation(pydantic.BaseModel):
     id_collar: int = pydantic.Field(..., alias="idCollar")
     acquisition_time: datetime = pydantic.Field(..., alias="acquisitionTime")
+    # Service-center timestamp: when Vectronic received the fix. The afterScts
+    # query filters on this, so it is what the per-collar cursor must track.
+    scts: Optional[datetime] = pydantic.Field(None, alias="scts")
     origin_code: Optional[str] = pydantic.Field(None, alias="originCode")
     ecef_x: Optional[int] = pydantic.Field(None, alias="ecefX")
     ecef_y: Optional[int] = pydantic.Field(None, alias="ecefY")
@@ -29,8 +32,10 @@ class VectronicObservation(pydantic.BaseModel):
     class Config:
         allow_population_by_field_name = True
 
-    @pydantic.validator('acquisition_time', always=True)
+    @pydantic.validator('acquisition_time', 'scts', always=True)
     def parse_time_string(cls, v):
+        if v is None:
+            return v
         if not v.tzinfo:
             return v.replace(tzinfo=timezone.utc)
         return v
