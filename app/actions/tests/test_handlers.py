@@ -313,6 +313,54 @@ async def test_action_fetch_collar_observations_collar_warning_fails_open(mocker
     mock_log_action_activity.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_collar_warning_releases_throttle_on_publish_failure(mocker, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mock_state_manager.delete_state.return_value = async_return(None)
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch(
+        "app.actions.handlers.log_action_activity", new=AsyncMock(side_effect=Exception("pubsub down"))
+    )
+    mocker.patch(
+        "app.actions.handlers.client.get_observations",
+        new=AsyncMock(side_effect=VectronicNotFoundException(Exception("404"), "Not found")),
+    )
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+
+    with pytest.raises(Exception, match="pubsub down"):
+        await action_fetch_collar_observations(integration, config)
+
+    # The next run must be able to publish the warning that never arrived.
+    mock_state_manager.delete_state.assert_called_once_with(
+        integration_id=integration.id,
+        action_id="fetch_collar_observations",
+        source_id="not-found-warning-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_collar_warning_no_release_when_not_reserved(mocker, mock_state_manager):
+    # Fail-open path: the throttle store was down, so there is no reservation to release.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mock_state_manager.set_if_absent.side_effect = Exception("redis down")
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch(
+        "app.actions.handlers.log_action_activity", new=AsyncMock(side_effect=Exception("pubsub down"))
+    )
+    mocker.patch(
+        "app.actions.handlers.client.get_observations",
+        new=AsyncMock(side_effect=VectronicNotFoundException(Exception("404"), "Not found")),
+    )
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+
+    with pytest.raises(Exception, match="pubsub down"):
+        await action_fetch_collar_observations(integration, config)
+
+    mock_state_manager.delete_state.assert_not_called()
+
+
 def test_transform_ok():
     obj = {
         "idCollar": "1",

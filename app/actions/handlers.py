@@ -63,13 +63,16 @@ def transform(observation):
 
 
 async def log_throttled_collar_warning(integration_id, collar_id, kind: str, title: str, data: dict = None):
+    throttle_key = f"{kind}-warning-{collar_id}"
+    reserved = False
     try:
-        first_in_window = await state_manager.set_if_absent(
+        reserved = await state_manager.set_if_absent(
             integration_id=integration_id,
             action_id="fetch_collar_observations",
-            source_id=f"{kind}-warning-{collar_id}",
+            source_id=throttle_key,
             ttl_seconds=COLLAR_WARNING_THROTTLE_SECONDS,
         )
+        first_in_window = reserved
     except Exception as throttle_error:
         # The throttle is best-effort noise control. Fail open: surface the
         # warning this time rather than hiding it or failing the action.
@@ -79,13 +82,30 @@ async def log_throttled_collar_warning(integration_id, collar_id, kind: str, tit
         )
         first_in_window = True
     if first_in_window:
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id="fetch_collar_observations",
-            level=LogLevel.WARNING,
-            title=title,
-            data=data,
-        )
+        try:
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id="fetch_collar_observations",
+                level=LogLevel.WARNING,
+                title=title,
+                data=data,
+            )
+        except Exception:
+            # The warning never arrived, so release the window; otherwise the
+            # next runs would stay silent for an hour about a warning nobody saw.
+            if reserved:
+                try:
+                    await state_manager.delete_state(
+                        integration_id=integration_id,
+                        action_id="fetch_collar_observations",
+                        source_id=throttle_key,
+                    )
+                except Exception as release_error:
+                    logger.warning(
+                        f"Could not release the collar warning throttle for collar {collar_id} "
+                        f"(integration '{integration_id}'): {release_error}"
+                    )
+            raise
 
 
 @activity_logger()
