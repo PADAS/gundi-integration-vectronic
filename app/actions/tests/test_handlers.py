@@ -14,7 +14,7 @@ from app.actions.client import (
 from app.actions.handlers import (
     action_pull_observations,
     action_fetch_collar_observations,
-    batches_by_receive_time,
+    checkpoints_by_receive_time,
     get_collar_key,
     CollarData,
     transform,
@@ -504,10 +504,57 @@ async def test_action_fetch_collar_observations_saves_cursor_after_each_batch(mo
     assert all("invalid location" not in c[1]["title"] for c in mock_log_action_activity.call_args_list)
 
 
-def test_batches_by_receive_time_never_split_a_shared_receive_time():
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_caps_requests_for_bulk_uploads(mocker, mock_state_manager):
+    # Collar 37590: 1,373 fixes share one scts. They must go out in requests of
+    # at most the batch size (a single 1,373-fix request got HTTP 504), and the
+    # cursor moves past the group only after every request succeeds.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.OBSERVATION_BATCH_SIZE", 2)
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    shared = [make_observation(f"2020-07-22T{h:02d}:00:00", scts="2026-06-22T18:55:47") for h in range(5)]
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=shared))
+    mock_send = mocker.patch(
+        "app.actions.handlers.send_observations_to_gundi",
+        new=AsyncMock(side_effect=lambda observations, integration_id: [{}] * len(observations)),
+    )
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2022-11-05T05:00:10", collar_id=37590)
+
+    result = await action_fetch_collar_observations(integration, config)
+
+    assert result == {"observations_extracted": 5}
+    assert [len(c[1]["observations"]) for c in mock_send.call_args_list] == [2, 2, 1]
+    mock_state_manager.set_state.assert_called_once()
+    assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2026-06-22T18:55:47"}
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_bulk_upload_failure_keeps_cursor(mocker, mock_state_manager):
+    # A request inside a shared-receive-time group fails: the cursor must not
+    # move past the group, or its unsent fixes would be skipped for good.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.OBSERVATION_BATCH_SIZE", 2)
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    shared = [make_observation(f"2020-07-22T{h:02d}:00:00", scts="2026-06-22T18:55:47") for h in range(5)]
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=shared))
+    mocker.patch(
+        "app.actions.handlers.send_observations_to_gundi",
+        new=AsyncMock(side_effect=[[{}, {}], Exception("HTTP 504")]),
+    )
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2022-11-05T05:00:10", collar_id=37590)
+
+    await action_fetch_collar_observations(integration, config)
+
+    mock_state_manager.set_state.assert_not_called()
+
+
+def test_checkpoints_by_receive_time_never_split_a_shared_receive_time():
     shared = [make_observation(f"2020-07-22T{h:02d}:00:00", scts="2026-06-22T18:55:47") for h in range(5)]
     later = [make_observation("2020-07-23T00:00:00", scts="2026-06-23T00:00:00")]
-    batches = list(batches_by_receive_time(shared + later, 2))
+    batches = list(checkpoints_by_receive_time(shared + later, 2))
     assert [len(b) for b in batches] == [5, 1]
 
 
