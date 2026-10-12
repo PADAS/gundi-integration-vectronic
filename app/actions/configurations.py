@@ -11,9 +11,14 @@ MAX_LOOKBACK_HOURS = 168  # 7 days
 
 
 class PullObservationsConfig(PullActionConfiguration):
+    # Holds every collar's key. Excluded from .dict() and repr so it stays out
+    # of activity events (the decorator publishes action_config.dict()) and
+    # log lines; the portal form schema is unaffected.
     files: str = FieldWithUIOptions(
         title="JSON String of Collars",
         description="A JSON string representing a list of collars to be processed",
+        exclude=True,
+        repr=False,
     )
     default_lookback_hours: int = FieldWithUIOptions(
         title="Data Retrieval Period (Hours)",
@@ -25,9 +30,12 @@ class PullObservationsConfig(PullActionConfiguration):
 
 
 class PullCollarObservationsConfig(InternalActionConfiguration):
+    # No collar key: it would travel in every PubSub message, activity event and
+    # log line. The handler looks it up from the integration's pull config.
+    # Messages published before this change still carry `collar_key`; pydantic
+    # ignores the extra field.
     start: datetime
     collar_id: int
-    collar_key: str
 
     @pydantic.validator('start', always=True)
     def parse_time_string(cls, v):

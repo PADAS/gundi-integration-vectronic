@@ -1,14 +1,35 @@
 import logging
+import re
 import httpx
 import pydantic
 
 from datetime import datetime, timezone
 from typing import Optional
-from app.services.state import IntegrationStateManager
 
 
 logger = logging.getLogger(__name__)
-state_manager = IntegrationStateManager()
+
+
+_COLLAR_KEY_PATTERN = re.compile(r"(collarkey=)[^&\s\"']+", re.IGNORECASE)
+
+
+def redact_collar_key(text: str) -> str:
+    return _COLLAR_KEY_PATTERN.sub(r"\1<redacted>", text)
+
+
+class _RedactCollarKey(logging.Filter):
+    """httpx logs every request URL at INFO, and Vectronic takes the collar key
+    as a query parameter, so mask it before the record reaches any handler."""
+
+    def filter(self, record):
+        message = record.getMessage()
+        if "collarkey=" in message.lower():
+            record.msg = redact_collar_key(message)
+            record.args = ()
+        return True
+
+
+logging.getLogger("httpx").addFilter(_RedactCollarKey())
 
 
 class VectronicObservation(pydantic.BaseModel):
@@ -67,15 +88,15 @@ class VectronicBadRequestException(Exception):
         super().__init__(f"'{self.status_code}: {self.message}, Error: {self.error}'")
 
 
-async def get_observations(integration, base_url, config):
+async def get_observations(base_url: str, collar_id: int, collar_key: str, after_scts: datetime):
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0)) as session:
-        logger.info(f"-- Getting observations for integration ID: {integration.id} Collar ID: {config.collar_id} --")
+        logger.info(f"-- Getting observations for Collar ID: {collar_id} after {after_scts} --")
 
-        url = f"{base_url}/v2/collar/{config.collar_id}/gps"
+        url = f"{base_url}/v2/collar/{collar_id}/gps"
 
         params = {
-            "collarkey": config.collar_key,
-            "afterScts": config.start.strftime("%Y-%m-%dT%H:%M:%S")
+            "collarkey": collar_key,
+            "afterScts": after_scts.strftime("%Y-%m-%dT%H:%M:%S")
         }
 
         try:
@@ -87,11 +108,15 @@ async def get_observations(integration, base_url, config):
             if parsed_response:
                 return [VectronicObservation.parse_obj(item) for item in parsed_response]
             else:
-                logger.warning(f"-- No observations returned for integration ID: {integration.id} Collar ID: {config.collar_id}: {response.text}  --")
+                logger.warning(f"-- No observations returned for Collar ID: {collar_id}: {response.text}  --")
                 return []
         except httpx.HTTPStatusError as e:
+            # The message embeds the request URL, collar key included, and
+            # callers log it. Re-raise with the key masked and without the
+            # original in the exception chain.
+            safe_error = httpx.HTTPStatusError(redact_collar_key(str(e)), request=e.request, response=e.response)
             if e.response.status_code == 403:
-                raise VectronicForbiddenException(e, "Unauthorized access")
+                raise VectronicForbiddenException(safe_error, "Unauthorized access") from None
             elif e.response.status_code == 404:
-                raise VectronicNotFoundException(e, "Not found")
-            raise e
+                raise VectronicNotFoundException(safe_error, "Not found") from None
+            raise safe_error from None

@@ -1,7 +1,11 @@
 import pytest
 import httpx
 from unittest.mock import AsyncMock, patch, MagicMock
+import logging
+from datetime import datetime, timezone
 from app.actions import client
+
+AFTER = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
 @pytest.mark.asyncio
 @patch("httpx.AsyncClient.get", new_callable=AsyncMock)
@@ -23,9 +27,7 @@ async def test_get_observations_success(mock_get):
     mock_response.raise_for_status.return_value = None
     mock_get.return_value = mock_response
 
-    integration = MagicMock(id=1)
-    config = MagicMock(collar_id=1, collar_key="key", start=MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00"))
-    result = await client.get_observations(integration, "http://test", config)
+    result = await client.get_observations(base_url="http://test", collar_id=1, collar_key="key", after_scts=AFTER)
     assert isinstance(result, list)
     assert result[0].id_collar == 1
 
@@ -39,9 +41,7 @@ async def test_get_observations_empty_response(mock_get):
     mock_response.raise_for_status.return_value = None
     mock_get.return_value = mock_response
 
-    integration = MagicMock(id=1)
-    config = MagicMock(collar_id=1, collar_key="key", start=MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00"))
-    result = await client.get_observations(integration, "http://test", config)
+    result = await client.get_observations(base_url="http://test", collar_id=1, collar_key="key", after_scts=AFTER)
     assert result == []
 
 @pytest.mark.asyncio
@@ -55,10 +55,8 @@ async def test_get_observations_403_forbidden(mock_get):
     mock_response.json = MagicMock()
     mock_get.return_value = mock_response
 
-    integration = MagicMock(id=1)
-    config = MagicMock(collar_id=1, collar_key="key", start=MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00"))
     with pytest.raises(client.VectronicForbiddenException):
-        await client.get_observations(integration, "http://test", config)
+        await client.get_observations(base_url="http://test", collar_id=1, collar_key="key", after_scts=AFTER)
 
 @pytest.mark.asyncio
 @patch("httpx.AsyncClient.get", new_callable=AsyncMock)
@@ -71,10 +69,8 @@ async def test_get_observations_404_not_found(mock_get):
     mock_response.json = MagicMock()
     mock_get.return_value = mock_response
 
-    integration = MagicMock(id=1)
-    config = MagicMock(collar_id=1, collar_key="key", start=MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00"))
     with pytest.raises(client.VectronicNotFoundException):
-        await client.get_observations(integration, "http://test", config)
+        await client.get_observations(base_url="http://test", collar_id=1, collar_key="key", after_scts=AFTER)
 
 @pytest.mark.asyncio
 @patch("httpx.AsyncClient.get", new_callable=AsyncMock)
@@ -87,10 +83,8 @@ async def test_get_observations_other_http_error(mock_get):
     mock_response.json = MagicMock()
     mock_get.return_value = mock_response
 
-    integration = MagicMock(id=1)
-    config = MagicMock(collar_id=1, collar_key="key", start=MagicMock(isoformat=lambda: "2024-01-01T00:00:00+00:00"))
     with pytest.raises(httpx.HTTPStatusError):
-        await client.get_observations(integration, "http://test", config)
+        await client.get_observations(base_url="http://test", collar_id=1, collar_key="key", after_scts=AFTER)
 
 
 def test_observation_parses_scts_as_utc():
@@ -115,3 +109,53 @@ def test_observation_normalizes_offset_timestamps_to_utc():
     })
     assert ob.acquisition_time.isoformat() == "2020-07-22T11:01:39+00:00"
     assert ob.scts.isoformat() == "2026-10-12T01:15:27+00:00"
+
+
+def test_httpx_request_log_redacts_collar_key(caplog):
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        logging.getLogger("httpx").info(
+            'HTTP Request: %s %s "%s %d %s"',
+            "GET",
+            "https://api.vectronic-wildlife.com/v2/collar/1/gps?collarkey=SECRETKEY123&afterScts=2024-01-01T00%3A00%3A00",
+            "HTTP/1.1", 200, "OK",
+        )
+    assert "SECRETKEY123" not in caplog.text
+    assert "collarkey=<redacted>&afterScts=" in caplog.text
+
+
+@pytest.mark.asyncio
+@patch("httpx.AsyncClient.get", new_callable=AsyncMock)
+async def test_get_observations_sends_key_and_after_scts(mock_get):
+    mock_response = MagicMock(is_error=False, text="")
+    mock_response.json = MagicMock(return_value=[])
+    mock_get.return_value = mock_response
+    await client.get_observations(base_url="http://test", collar_id=7, collar_key="key", after_scts=AFTER)
+    args, kwargs = mock_get.call_args
+    assert args[0] == "http://test/v2/collar/7/gps"
+    assert kwargs["params"] == {"collarkey": "key", "afterScts": "2024-01-01T00:00:00"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code,expected", [
+    (403, client.VectronicForbiddenException),
+    (404, client.VectronicNotFoundException),
+    (500, httpx.HTTPStatusError),
+])
+@patch("httpx.AsyncClient.get", new_callable=AsyncMock)
+async def test_get_observations_http_errors_do_not_expose_collar_key(mock_get, status_code, expected):
+    # httpx's real message embeds the request URL, query string included.
+    url = "https://api.vectronic-wildlife.com/v2/collar/1/gps?collarkey=SECRETKEY123&afterScts=2024-01-01T00%3A00%3A00"
+    request = httpx.Request("GET", url)
+    response = httpx.Response(status_code=status_code, request=request)
+    mock_response = MagicMock(is_error=True, text="error")
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        f"Client error '{status_code}' for url '{url}'", request=request, response=response
+    )
+    mock_get.return_value = mock_response
+
+    with pytest.raises(expected) as exc_info:
+        await client.get_observations(base_url="http://test", collar_id=1, collar_key="SECRETKEY123", after_scts=AFTER)
+
+    assert "SECRETKEY123" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__
