@@ -189,6 +189,27 @@ async def test_action_fetch_collar_observations_mixed_valid_and_invalid(mocker, 
 
 
 @pytest.mark.asyncio
+async def test_action_fetch_collar_observations_summary_failure_does_not_block_delivery(mocker, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123, collar_key="K")
+    valid_ob = make_observation("2024-01-01T01:00:00")
+    invalid_ob = make_observation("2024-01-01T02:00:00", latitude=None)
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mock_send = mocker.patch(
+        "app.actions.handlers.send_observations_to_gundi", new=AsyncMock(return_value=[{"object_id": "x"}])
+    )
+    mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock(side_effect=Exception("pubsub down")))
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[valid_ob, invalid_ob]))
+
+    result = await action_fetch_collar_observations(integration, config)
+
+    assert result == {"observations_extracted": 1}
+    mock_send.assert_awaited_once()
+    assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2024-01-01T02:00:00"}
+
+
+@pytest.mark.asyncio
 async def test_action_fetch_collar_observations_does_not_publish_started_event(mocker, mock_state_manager):
     mock_publish_event = mocker.patch("app.services.activity_logger.publish_event", new_callable=AsyncMock)
     mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[]))

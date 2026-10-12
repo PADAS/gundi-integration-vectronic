@@ -190,16 +190,24 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
 
             if invalid_observations:
                 # One summary per collar per run rather than one entry per fix.
-                await log_action_activity(
-                    integration_id=integration.id,
-                    action_id="fetch_collar_observations",
-                    level=LogLevel.WARNING,
-                    title=f"Collar ID {action_config.collar_id}: skipped {len(invalid_observations)} observation(s) with an invalid location.",
-                    data={
-                        "skipped_count": len(invalid_observations),
-                        "sample_observations": [ob.dict() for ob in invalid_observations[:INVALID_OBSERVATION_SAMPLE_SIZE]],
-                    }
-                )
+                # Best-effort: each skip is already in the application log, and a
+                # publish failure must not block delivery or the cursor update below.
+                try:
+                    await log_action_activity(
+                        integration_id=integration.id,
+                        action_id="fetch_collar_observations",
+                        level=LogLevel.WARNING,
+                        title=f"Collar ID {action_config.collar_id}: skipped {len(invalid_observations)} observation(s) with an invalid location.",
+                        data={
+                            "skipped_count": len(invalid_observations),
+                            "sample_observations": [ob.dict() for ob in invalid_observations[:INVALID_OBSERVATION_SAMPLE_SIZE]],
+                        }
+                    )
+                except Exception as log_error:
+                    logger.warning(
+                        f"Could not publish the invalid-observation summary for collar {action_config.collar_id} "
+                        f"(integration '{integration.id}'): {log_error}"
+                    )
 
             for i, batch in enumerate(generate_batches(transformed_data, 200)):
                 logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Collar: {action_config.collar_id}')
