@@ -21,6 +21,14 @@ state_manager = IntegrationStateManager()
 
 VECTRONIC_BASE_URL = "https://api.vectronic-wildlife.com"
 
+# A broken collar (bad key, unknown ID, upstream errors) fails the same way on
+# every scheduled run, so its activity-log warning is published at most once
+# per window per collar. The local application log still records every run.
+COLLAR_WARNING_THROTTLE_SECONDS = 3600
+
+# How many skipped observations to attach to the invalid-location summary.
+INVALID_OBSERVATION_SAMPLE_SIZE = 3
+
 
 class CollarData(pydantic.BaseModel):
     collar_id: str = pydantic.Field(..., alias="collarID")
@@ -52,6 +60,32 @@ def transform(observation):
             **additional_info
         }
     }
+
+
+async def log_throttled_collar_warning(integration_id, collar_id, kind: str, title: str, data: dict = None):
+    try:
+        first_in_window = await state_manager.set_if_absent(
+            integration_id=integration_id,
+            action_id="fetch_collar_observations",
+            source_id=f"{kind}-warning-{collar_id}",
+            ttl_seconds=COLLAR_WARNING_THROTTLE_SECONDS,
+        )
+    except Exception as throttle_error:
+        # The throttle is best-effort noise control. Fail open: surface the
+        # warning this time rather than hiding it or failing the action.
+        logger.warning(
+            f"Collar warning throttle unavailable for collar {collar_id} "
+            f"(integration '{integration_id}'): {throttle_error}. Publishing the warning."
+        )
+        first_in_window = True
+    if first_in_window:
+        await log_action_activity(
+            integration_id=integration_id,
+            action_id="fetch_collar_observations",
+            level=LogLevel.WARNING,
+            title=title,
+            data=data,
+        )
 
 
 @activity_logger()
@@ -111,7 +145,9 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     return {"status": "success", "collars_triggered": collars_triggered}
 
 
-@activity_logger()
+# No "started" event: this runs once per collar per schedule tick, and a
+# start/complete pair per collar flooded the activity log for large integrations.
+@activity_logger(on_start=False)
 async def action_fetch_collar_observations(integration, action_config: PullCollarObservationsConfig):
     logger.info(f"Executing 'fetch_collar_observations' action with integration ID {integration.id} and action_config {action_config}...")
 
@@ -124,36 +160,44 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         if observations:
             logger.info(f"Extracted {len(observations)} observations for collar {action_config.collar_id}")
 
+            invalid_observations = []
             for ob in observations:
                 if ob.latitude is None or ob.longitude is None:
-                    message = f"Collar ID {ob.id_collar} got an invalid observation (location is invalid). Skipping..."
-                    logger.warning(message)
-                    await log_action_activity(
-                        integration_id=integration.id,
-                        action_id="fetch_collar_observations",
-                        level=LogLevel.WARNING,
-                        title=message,
-                        data={"observation": ob.dict()}
-                    )
+                    logger.warning(f"Collar ID {ob.id_collar} got an invalid observation (location is invalid). Skipping...")
+                    invalid_observations.append(ob)
                     continue
                 transformed_data.append(transform(ob))
 
-            if transformed_data:
-                for i, batch in enumerate(generate_batches(transformed_data, 200)):
-                    logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Collar: {action_config.collar_id}')
-                    response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
-                    observations_extracted += len(response)
-
-                # Save latest device updated_at
-                latest_time = max(observations, key=lambda obs: obs.acquisition_time).acquisition_time
-                state = {"updated_at": latest_time.strftime("%Y-%m-%dT%H:%M:%S")}
-
-                await state_manager.set_state(
+            if invalid_observations:
+                # One summary per collar per run rather than one entry per fix.
+                await log_action_activity(
                     integration_id=integration.id,
-                    action_id="pull_observations",
-                    state=state,
-                    source_id=str(action_config.collar_id)
+                    action_id="fetch_collar_observations",
+                    level=LogLevel.WARNING,
+                    title=f"Collar ID {action_config.collar_id}: skipped {len(invalid_observations)} observation(s) with an invalid location.",
+                    data={
+                        "skipped_count": len(invalid_observations),
+                        "sample_observations": [ob.dict() for ob in invalid_observations[:INVALID_OBSERVATION_SAMPLE_SIZE]],
+                    }
                 )
+
+            for i, batch in enumerate(generate_batches(transformed_data, 200)):
+                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Collar: {action_config.collar_id}')
+                response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
+                observations_extracted += len(response)
+
+            # Advance the cursor past every returned observation, including
+            # skipped ones; otherwise a run that only sees invalid fixes
+            # re-fetches (and re-reports) the same fixes on every run.
+            latest_time = max(observations, key=lambda obs: obs.acquisition_time).acquisition_time
+            state = {"updated_at": latest_time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+            await state_manager.set_state(
+                integration_id=integration.id,
+                action_id="pull_observations",
+                state=state,
+                source_id=str(action_config.collar_id)
+            )
 
             return {"observations_extracted": observations_extracted}
         else:
@@ -161,10 +205,10 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
     except client.VectronicForbiddenException as e:
         message = f"Unauthorized response from Vectronic with integration {integration.id} using {action_config}. Exception: {e}"
         logger.warning(message)
-        await log_action_activity(
+        await log_throttled_collar_warning(
             integration_id=integration.id,
-            action_id="fetch_collar_observations",
-            level=LogLevel.WARNING,
+            collar_id=action_config.collar_id,
+            kind="unauthorized",
             title="Unauthorized access (bad collar key and/or collar ID)",
             data={"message": message, "data": action_config}
         )
@@ -172,10 +216,10 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
     except client.VectronicNotFoundException as e:
         message = f"Collar ID {action_config.collar_id} not found. Integration {integration.id} using {action_config}. Exception: {e}"
         logger.warning(message)
-        await log_action_activity(
+        await log_throttled_collar_warning(
             integration_id=integration.id,
-            action_id="fetch_collar_observations",
-            level=LogLevel.WARNING,
+            collar_id=action_config.collar_id,
+            kind="not-found",
             title=f"Collar ID {action_config.collar_id} not found.",
             data={"message": message, "data": action_config}
         )
@@ -186,10 +230,10 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         status_code = e.response.status_code
         message = f"Vectronic returned HTTP {status_code} for collar {action_config.collar_id} from integration ID {integration.id}. Exception: {e}"
         logger.warning(message)
-        await log_action_activity(
+        await log_throttled_collar_warning(
             integration_id=integration.id,
-            action_id="fetch_collar_observations",
-            level=LogLevel.WARNING,
+            collar_id=action_config.collar_id,
+            kind="http-error",
             title=f"Vectronic returned HTTP {status_code} for collar {action_config.collar_id}.",
             data={"message": message, "data": action_config}
         )
