@@ -29,6 +29,7 @@ from gundi_core.events import (
 )
 from app import settings
 from app.services.errors import format_error_message
+from app.services.redaction import redact_secrets
 
 
 logger = logging.getLogger(__name__)
@@ -78,8 +79,40 @@ async def publish_event(event: SystemEventBaseModel, topic_name: str):
 
 
 
-# Cloud PubSub accepts at most 1,000 messages (10 MB) per publish request.
+# Cloud PubSub accepts at most 1,000 messages and 10 MB per publish request
+# (https://cloud.google.com/pubsub/quotas). The byte limit applies to the
+# serialized request body: base64-encoded data plus JSON framing, which is
+# what gcloud-aio's PublisherClient.publish sends.
 PUBSUB_MAX_MESSAGES_PER_PUBLISH = 1000
+PUBSUB_MAX_BYTES_PER_PUBLISH = 10 * 1000 * 1000
+# json.dumps with default separators, as gcloud-aio serializes the request:
+# '{"messages": []}' around the batch, ', ' between messages.
+_PUBLISH_ENVELOPE_BYTES = len(json.dumps({"messages": []}))
+_PUBLISH_SEPARATOR_BYTES = len(", ")
+
+
+def _serialized_size(message) -> int:
+    return len(json.dumps(message.to_repr())) + _PUBLISH_SEPARATOR_BYTES
+
+
+def _publish_batches(messages):
+    """Split messages into lists that each fit one publish request, by count
+    and by serialized size. A single message over the byte limit cannot be
+    split, so it is sent alone: PubSub's rejection then names it, instead of
+    the whole batch failing on every retry or the message being dropped."""
+    batch, batch_bytes = [], _PUBLISH_ENVELOPE_BYTES
+    for message in messages:
+        size = _serialized_size(message)
+        if batch and (
+            len(batch) >= PUBSUB_MAX_MESSAGES_PER_PUBLISH
+            or batch_bytes + size > PUBSUB_MAX_BYTES_PER_PUBLISH
+        ):
+            yield batch
+            batch, batch_bytes = [], _PUBLISH_ENVELOPE_BYTES
+        batch.append(message)
+        batch_bytes += size
+    if batch:
+        yield batch
 
 
 @stamina.retry(
@@ -105,7 +138,7 @@ async def publish_events(events: List[SystemEventBaseModel], topic_name: str):
     """Publish many events to one topic in as few requests as possible.
 
     One session and one token for the whole list, split at PubSub's
-    per-request limit. publish_event opens a session and fetches a token per
+    per-request limits (1,000 messages, 10 MB serialized). publish_event opens a session and fetches a token per
     call, and an action that fans out one command per source (hundreds per
     integration) overran Cloud Run's request timeout doing that serially.
     Returns the combined {"messageIds": [...]}, or None on the ephemeral path
@@ -123,12 +156,11 @@ async def publish_events(events: List[SystemEventBaseModel], topic_name: str):
         client = pubsub.PublisherClient(session=session)
         topic = client.topic_path(settings.GCP_PROJECT_ID, topic_name)
         message_ids = []
-        for start in range(0, len(events), PUBSUB_MAX_MESSAGES_PER_PUBLISH):
-            batch = events[start:start + PUBSUB_MAX_MESSAGES_PER_PUBLISH]
-            messages = [
-                pubsub.PubsubMessage(json.dumps(event.dict(), default=str).encode("utf-8"))
-                for event in batch
-            ]
+        all_messages = [
+            pubsub.PubsubMessage(json.dumps(event.dict(), default=str).encode("utf-8"))
+            for event in events
+        ]
+        for messages in _publish_batches(all_messages):
             logger.debug(f"Sending {len(messages)} events to PubSub topic {topic_name}..")
             response = await _publish_batch(client, topic, messages, topic_name)
             message_ids.extend((response or {}).get("messageIds", []))
@@ -157,7 +189,7 @@ async def log_action_activity(integration_id: str, action_id: str, title: str, l
             payload=CustomActivityLog(
                 integration_id=integration_id,
                 action_id=action_id,
-                config_data=config_data or {},
+                config_data=redact_secrets(config_data or {}),
                 title=title,
                 level=level,
                 data=data
@@ -185,7 +217,7 @@ async def log_webhook_activity(
             payload=CustomWebhookLog(
                 integration_id=integration_id,
                 webhook_id=webhook_id,
-                config_data=config_data or {},
+                config_data=redact_secrets(config_data or {}),
                 title=title,
                 level=level,
                 data=data
@@ -193,6 +225,17 @@ async def log_webhook_activity(
         ),
         topic_name=settings.INTEGRATION_EVENTS_TOPIC,
     )
+
+
+def _redacted_config_dict(config) -> dict:
+    """The config a decorated handler ran with, serialized for its activity
+    events with secrets masked. Masks by key name and by what the config's
+    model declares secret (SecretStr, format="password", password widget, at
+    any depth), so a password typed as plain str does not reach the feed in
+    clear."""
+    if not config:
+        return {}
+    return redact_secrets(config.dict(), model=type(config))
 
 
 def activity_logger(on_start=True, on_completion=True, on_error=True):
@@ -203,7 +246,7 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
             integration_id = str(integration.id) if integration else None
             action_id = func.__name__.replace("action_", "")
             action_config = kwargs.get("action_config")
-            config_data = action_config.dict() if action_config else {} or {}
+            config_data = _redacted_config_dict(action_config)
             if on_start:
                 await publish_event(
                     event=IntegrationActionStarted(
@@ -256,7 +299,7 @@ def webhook_activity_logger(on_start=True, on_completion=True, on_error=True):
             integration = kwargs.get("integration")
             integration_id = str(integration.id) if integration else None
             webhook_config = kwargs.get("webhook_config")
-            config_data = webhook_config.dict() if webhook_config else {} or {}
+            config_data = _redacted_config_dict(webhook_config)
             webhook_id = str(integration.webhook_configuration.webhook.value) if integration and integration.webhook_configuration else "webhook"
             if on_start:
                 await publish_event(
