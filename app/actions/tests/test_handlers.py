@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from datetime import datetime, timezone
 import json
@@ -242,7 +243,9 @@ async def test_action_fetch_collar_observations_mixed_valid_and_invalid(mocker, 
     sent = mock_send.call_args[1]["observations"]
     assert len(sent) == 1
     assert sent[0]["location"] == {"lat": 1.0, "lon": 2.0}
-    assert mock_log_action_activity.call_args[1]["data"]["skipped_count"] == 1
+    summary, completion = [c[1] for c in mock_log_action_activity.call_args_list]
+    assert summary["data"]["skipped_count"] == 1
+    assert completion["title"] == "Collar ID 123: sent 1 observation(s) to Gundi."
     assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2024-01-01T02:00:00"}
 
 
@@ -265,20 +268,6 @@ async def test_action_fetch_collar_observations_summary_failure_does_not_block_d
     assert result == {"observations_extracted": 1}
     mock_send.assert_awaited_once()
     assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2024-01-01T02:00:00"}
-
-
-@pytest.mark.asyncio
-async def test_action_fetch_collar_observations_does_not_publish_started_event(mocker, mock_state_manager):
-    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
-    mock_publish_event = mocker.patch("app.services.activity_logger.publish_event", new_callable=AsyncMock)
-    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[]))
-    integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
-
-    await action_fetch_collar_observations(integration=integration, action_config=config)
-
-    published = [c[1]["event"].event_type for c in mock_publish_event.call_args_list]
-    assert published == ["IntegrationActionComplete"]
 
 
 @pytest.mark.asyncio
@@ -687,6 +676,139 @@ def test_collar_data_parsing_error():
     with pytest.raises(ValidationError) as exc_info:
         CollarData.parse_obj(data)
     assert "collarID" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_with_nothing_new_publishes_no_activity(mocker, mock_state_manager):
+    # Runs once per collar per schedule tick: an "action completed" entry for
+    # every empty run buried the useful entries in the activity log.
+    mock_publish_event = mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[]))
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=35245)
+
+    result = await action_fetch_collar_observations(integration=integration, action_config=config)
+
+    assert result == {"observations_extracted": 0}
+    mock_publish_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_logs_one_entry_naming_the_collar(mocker, mock_state_manager):
+    mock_publish_event = mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    observations = [make_observation(f"2024-01-01T0{i}:00:00", collar_id=35245) for i in range(1, 4)]
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=observations))
+    mocker.patch(
+        "app.actions.handlers.send_observations_to_gundi",
+        new=AsyncMock(side_effect=lambda observations, integration_id: observations),
+    )
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=35245)
+
+    result = await action_fetch_collar_observations(integration=integration, action_config=config)
+
+    assert result == {"observations_extracted": 3}
+    mock_publish_event.assert_awaited_once()
+    payload = mock_publish_event.call_args.kwargs["event"].payload
+    assert payload.title == "Collar ID 35245: sent 3 observation(s) to Gundi."
+    assert payload.level == LogLevel.INFO
+    assert payload.data == {"collar_id": 35245, "observations_extracted": 3}
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_completion_entry_failure_does_not_fail_the_run(mocker, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[make_observation("2024-01-01T01:00:00")]))
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", new=AsyncMock(return_value=[{"object_id": "x"}]))
+    mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock(side_effect=Exception("pubsub down")))
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
+
+    result = await action_fetch_collar_observations(integration, config)
+
+    # The observations are already in Gundi and the cursor is saved.
+    assert result == {"observations_extracted": 1}
+    assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2024-01-01T01:00:00"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error, failure_title", [
+    (Exception("gundi down"), "Failed to fetch observations for collar 123."),
+    (
+        httpx.HTTPStatusError(
+            "Server error",
+            request=httpx.Request("POST", "https://gundi.example/v2/observations/"),
+            response=httpx.Response(status_code=502, request=httpx.Request("POST", "https://gundi.example/v2/observations/")),
+        ),
+        # Gundi's error, not reported as Vectronic's.
+        "Gundi returned HTTP 502 while sending observations for collar 123.",
+    ),
+])
+async def test_action_fetch_collar_observations_reports_what_was_sent_before_a_failure(mocker, mock_state_manager, error, failure_title):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.OBSERVATION_BATCH_SIZE", 2)
+    observations = [make_observation(f"2024-01-01T0{i}:00:00", collar_id=123) for i in range(1, 5)]
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=observations))
+    # The first checkpoint reaches Gundi; the second request fails.
+    mocker.patch(
+        "app.actions.handlers.send_observations_to_gundi",
+        new=AsyncMock(side_effect=[[{"object_id": "a"}, {"object_id": "b"}], error]),
+    )
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
+
+    result = await action_fetch_collar_observations(integration, config)
+
+    assert result == {"observations_extracted": 2}
+    titles = [c[1]["title"] for c in mock_log_action_activity.call_args_list]
+    assert titles == [failure_title, "Collar ID 123: sent 2 observation(s) to Gundi."]
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_gundi_errors_do_not_share_the_vectronic_throttle(mocker, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[make_observation("2024-01-01T01:00:00")]))
+    request = httpx.Request("POST", "https://gundi.example/v2/observations/")
+    mocker.patch(
+        "app.actions.handlers.send_observations_to_gundi",
+        new=AsyncMock(side_effect=httpx.HTTPStatusError("Bad gateway", request=request, response=httpx.Response(502, request=request))),
+    )
+    mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
+
+    await action_fetch_collar_observations(integration, config)
+
+    assert mock_state_manager.set_if_absent.call_args[1]["source_id"] == "gundi-error-warning-123"
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_cancelled_run_skips_the_sent_entry(mocker, mock_state_manager):
+    # Publishing retries with backoff; a cancelled run (timeout, shutdown)
+    # must not hold the worker past its deadline to report a count.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.OBSERVATION_BATCH_SIZE", 1)
+    observations = [make_observation(f"2024-01-01T0{i}:00:00", collar_id=123) for i in range(1, 3)]
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=observations))
+    mocker.patch(
+        "app.actions.handlers.send_observations_to_gundi",
+        new=AsyncMock(side_effect=[[{"object_id": "a"}], asyncio.CancelledError()]),
+    )
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
+
+    with pytest.raises(asyncio.CancelledError):
+        await action_fetch_collar_observations(integration, config)
+
+    mock_log_action_activity.assert_not_awaited()
 
 
 def test_template_redaction_masks_the_collar_key():

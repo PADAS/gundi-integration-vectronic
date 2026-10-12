@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import sys
 import httpx
 import pydantic
 
@@ -33,6 +35,15 @@ INVALID_OBSERVATION_SAMPLE_SIZE = 3
 
 # Max observations per request to Gundi; larger requests time out (HTTP 504).
 OBSERVATION_BATCH_SIZE = 200
+
+
+class GundiDeliveryError(Exception):
+    """Gundi rejected a batch of observations. Kept apart from the collar
+    API's httpx errors so it is not reported, or throttled, as Vectronic's."""
+
+    def __init__(self, error: httpx.HTTPStatusError):
+        self.status_code = error.response.status_code
+        super().__init__(str(error))
 
 
 class CollarData(pydantic.BaseModel):
@@ -226,9 +237,33 @@ async def save_cursor(integration_id, collar_id: int, cursor: datetime):
     )
 
 
-# No "started" event: this runs once per collar per schedule tick, and a
-# start/complete pair per collar flooded the activity log for large integrations.
-@activity_logger(on_start=False)
+async def log_sent_observations(integration_id, collar_id: int, count: int):
+    # Best-effort: these observations are already in Gundi, so a lost activity
+    # entry must not fail or retry the run. After a failure partway through a
+    # checkpoint the cursor is not saved past them, so the redelivered run
+    # sends them again and its entry counts them again.
+    try:
+        await log_action_activity(
+            integration_id=integration_id,
+            action_id="fetch_collar_observations",
+            level=LogLevel.INFO,
+            title=f"Collar ID {collar_id}: sent {count} observation(s) to Gundi.",
+            data={"collar_id": collar_id, "observations_extracted": count},
+        )
+    except Exception as log_error:
+        logger.warning(
+            f"Could not publish the sent-observations entry for collar {collar_id} "
+            f"(integration '{integration_id}'): {log_error}"
+        )
+
+
+# No "started" or generic "completed" event: this runs once per collar per
+# schedule tick, and an entry per collar per run flooded the activity log for
+# large integrations. Nothing in Gundi reads the "completed" event (integration
+# health counts ERROR entries), so dropping it only quiets the log. A run that
+# sends observations logs its own entry naming the collar. Failures are caught
+# below and log their own warning or error entry, so on_error rarely fires.
+@activity_logger(on_start=False, on_completion=False)
 async def action_fetch_collar_observations(integration, action_config: PullCollarObservationsConfig):
     logger.info(f"Executing 'fetch_collar_observations' action with integration ID {integration.id} and action_config {action_config}...")
 
@@ -281,7 +316,10 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
 
             for batch in generate_batches(transformed_data, OBSERVATION_BATCH_SIZE):
                 logger.info(f'Sending observations batch #{batch_number}: {len(batch)} observations. Collar: {action_config.collar_id}')
-                response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
+                try:
+                    response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
+                except httpx.HTTPStatusError as e:
+                    raise GundiDeliveryError(e) from e
                 observations_extracted += len(response)
                 batch_number += 1
 
@@ -323,7 +361,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             title="Unauthorized access (bad collar key and/or collar ID)",
             data={"message": message, "data": action_config}
         )
-        return {"observations_extracted": 0}
+        return {"observations_extracted": observations_extracted}
     except client.VectronicNotFoundException as e:
         message = f"Collar ID {action_config.collar_id} not found. Integration {integration.id} using {action_config}. Exception: {e}"
         logger.warning(message)
@@ -334,7 +372,21 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             title=f"Collar ID {action_config.collar_id} not found.",
             data={"message": message, "data": action_config}
         )
-        return {"observations_extracted": 0}
+        return {"observations_extracted": observations_extracted}
+    except GundiDeliveryError as e:
+        message = (
+            f"Gundi returned HTTP {e.status_code} while sending observations for collar {action_config.collar_id} "
+            f"from integration ID {integration.id}, after {observations_extracted} were sent. Exception: {e}"
+        )
+        logger.warning(message)
+        await log_throttled_collar_warning(
+            integration_id=integration.id,
+            collar_id=action_config.collar_id,
+            kind="gundi-error",
+            title=f"Gundi returned HTTP {e.status_code} while sending observations for collar {action_config.collar_id}.",
+            data={"message": message, "data": action_config}
+        )
+        return {"observations_extracted": observations_extracted}
     except httpx.HTTPStatusError as e:
         # Other 4xx/5xx responses from the collar API (403/404 are handled above).
         # These are upstream/transient conditions, not integration errors, so log as a warning.
@@ -348,7 +400,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             title=f"Vectronic returned HTTP {status_code} for collar {action_config.collar_id}.",
             data={"message": message, "data": action_config}
         )
-        return {"observations_extracted": 0}
+        return {"observations_extracted": observations_extracted}
     except Exception as e:
         message = f"Failed to fetch observations for collar {action_config.collar_id} from integration ID {integration.id}. Exception: {e}"
         logger.exception(message)
@@ -359,4 +411,11 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             title=f"Failed to fetch observations for collar {action_config.collar_id}.",
             data={"message": message, "data": action_config}
         )
-        return {"observations_extracted": 0}
+        return {"observations_extracted": observations_extracted}
+    finally:
+        # Also after a failure: earlier checkpoints may already be in Gundi.
+        # Not on cancellation (a timeout or shutdown): publishing retries with
+        # backoff and would hold the worker past its deadline.
+        cancelled = isinstance(sys.exc_info()[1], asyncio.CancelledError)
+        if observations_extracted and not cancelled:
+            await log_sent_observations(integration.id, action_config.collar_id, observations_extracted)
