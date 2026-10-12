@@ -177,6 +177,10 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
 
     try:
         observations = await client.get_observations(integration, base_url, action_config)
+        # The cursor is the latest scts already processed. If afterScts is
+        # inclusive, fixes received at exactly the cursor come back on every
+        # run, so drop anything at or before it.
+        observations = [ob for ob in observations if ob.scts is None or ob.scts > action_config.start]
         if observations:
             logger.info(f"Extracted {len(observations)} observations for collar {action_config.collar_id}")
 

@@ -185,6 +185,28 @@ async def test_action_fetch_collar_observations_cursor_tracks_receive_time(mocke
 
 
 @pytest.mark.asyncio
+async def test_action_fetch_collar_observations_drops_fixes_at_or_before_cursor(mocker, mock_state_manager):
+    # Fixes received at exactly the cursor were processed by an earlier run; an
+    # inclusive afterScts returns them again, and they must not be re-reported.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2026-06-22T18:55:47", collar_id=37590, collar_key="K")
+    seen_obs = [
+        make_observation("2020-07-22T13:01:39", latitude=None, longitude=None, scts="2026-06-22T18:55:47"),
+        make_observation("2020-07-22T14:01:39", latitude=None, longitude=None, scts="2026-06-22T18:55:47"),
+    ]
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=seen_obs))
+
+    result = await action_fetch_collar_observations(integration, config)
+
+    assert result == {"observations_extracted": 0}
+    mock_log_action_activity.assert_not_awaited()
+    mock_state_manager.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_action_fetch_collar_observations_mixed_valid_and_invalid(mocker, mock_state_manager):
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
