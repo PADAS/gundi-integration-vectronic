@@ -13,11 +13,19 @@ from app.actions.client import (
 from app.actions.handlers import (
     action_pull_observations,
     action_fetch_collar_observations,
+    batches_by_receive_time,
+    get_collar_key,
     CollarData,
     transform,
 )
 from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
 from app.conftest import async_return
+
+
+@pytest.fixture(autouse=True)
+def collar_key_lookup(mocker):
+    # Fetch tests use a bare MagicMock integration with no pull config.
+    return mocker.patch("app.actions.handlers.get_collar_key", return_value="K")
 
 @pytest.mark.asyncio
 async def test_action_pull_observations_triggers_fetch_collar_observations(mocker, mock_publish_event, mock_state_manager):
@@ -48,7 +56,8 @@ async def test_action_pull_observations_triggers_fetch_collar_observations(mocke
     assert kwargs["action_id"] == "fetch_collar_observations"
     configs = kwargs["configs"]
     assert [c.collar_id for c in configs] == [1]
-    assert configs[0].collar_key == "K"
+    # The key is looked up by the fetch handler, never carried in the message.
+    assert "collar_key" not in configs[0].dict()
 
 @pytest.mark.asyncio
 async def test_action_pull_observations_bad_json(mocker, mock_publish_event, mock_state_manager):
@@ -72,13 +81,14 @@ async def test_action_pull_observations_empty_list(mocker, mock_publish_event, m
     assert result["collars_triggered"] == 0
 
 @pytest.mark.asyncio
-async def test_action_fetch_collar_observations_no_observations(mocker):
+async def test_action_fetch_collar_observations_no_observations(mocker, mock_state_manager):
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
     mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.services.action_runner.publish_event", new=AsyncMock())
     mocker.patch("app.services.action_scheduler.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
     mock_get_obs.return_value = []
     result = await action_fetch_collar_observations(integration, config)
     assert result["observations_extracted"] == 0
@@ -97,7 +107,7 @@ def make_observation(acquisition_time, latitude=1.0, longitude=2.0, collar_id=12
 async def test_action_fetch_collar_observations_summarizes_invalid_locations(mocker, caplog, mock_state_manager):
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
     invalid_obs = [
         make_observation(f"2024-01-01T0{i}:00:00", latitude=None, longitude=None)
         for i in range(5)
@@ -128,7 +138,7 @@ async def test_action_fetch_collar_observations_advances_cursor_when_all_invalid
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     # Without advancing the cursor, the next run re-fetches and re-reports the same fixes.
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2022-09-01T00:00:00", collar_id=123, collar_key="K")
+    config = PullCollarObservationsConfig(start="2022-09-01T00:00:00", collar_id=123)
     invalid_obs = [
         make_observation("2022-09-26T16:01:39", latitude=None, longitude=None),
         make_observation("2022-09-25T10:00:00", latitude=None, longitude=None),
@@ -153,7 +163,7 @@ async def test_action_fetch_collar_observations_cursor_never_moves_backward(mock
     # time older than the current cursor; keeping it would widen the next query.
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2026-10-12T00:00:00", collar_id=123, collar_key="K")
+    config = PullCollarObservationsConfig(start="2026-10-12T00:00:00", collar_id=123)
     late_ob = make_observation("2022-09-26T16:01:39", latitude=None, longitude=None)
     mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
     mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
@@ -170,7 +180,7 @@ async def test_action_fetch_collar_observations_cursor_tracks_receive_time(mocke
     # cursor must move past their receive time or every run re-fetches them.
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2026-10-12T00:00:00", collar_id=37590, collar_key="K")
+    config = PullCollarObservationsConfig(start="2026-10-12T00:00:00", collar_id=37590)
     late_obs = [
         make_observation("2020-07-22T13:01:39", latitude=None, longitude=None, scts="2026-10-12T03:10:00"),
         make_observation("2020-07-22T14:01:39", latitude=None, longitude=None, scts="2026-10-12T03:15:27"),
@@ -190,7 +200,7 @@ async def test_action_fetch_collar_observations_drops_fixes_at_or_before_cursor(
     # inclusive afterScts returns them again, and they must not be re-reported.
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2026-06-22T18:55:47", collar_id=37590, collar_key="K")
+    config = PullCollarObservationsConfig(start="2026-06-22T18:55:47", collar_id=37590)
     seen_obs = [
         make_observation("2020-07-22T13:01:39", latitude=None, longitude=None, scts="2026-06-22T18:55:47"),
         make_observation("2020-07-22T14:01:39", latitude=None, longitude=None, scts="2026-06-22T18:55:47"),
@@ -210,7 +220,7 @@ async def test_action_fetch_collar_observations_drops_fixes_at_or_before_cursor(
 async def test_action_fetch_collar_observations_mixed_valid_and_invalid(mocker, mock_state_manager):
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
     valid_ob = make_observation("2024-01-01T01:00:00")
     # The latest observation is invalid; the cursor still moves past it.
     invalid_ob = make_observation("2024-01-01T02:00:00", latitude=None)
@@ -235,7 +245,7 @@ async def test_action_fetch_collar_observations_mixed_valid_and_invalid(mocker, 
 async def test_action_fetch_collar_observations_summary_failure_does_not_block_delivery(mocker, mock_state_manager):
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
     valid_ob = make_observation("2024-01-01T01:00:00")
     invalid_ob = make_observation("2024-01-01T02:00:00", latitude=None)
     mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
@@ -254,10 +264,11 @@ async def test_action_fetch_collar_observations_summary_failure_does_not_block_d
 
 @pytest.mark.asyncio
 async def test_action_fetch_collar_observations_does_not_publish_started_event(mocker, mock_state_manager):
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
     mock_publish_event = mocker.patch("app.services.activity_logger.publish_event", new_callable=AsyncMock)
     mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[]))
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
 
     await action_fetch_collar_observations(integration=integration, action_config=config)
 
@@ -266,12 +277,13 @@ async def test_action_fetch_collar_observations_does_not_publish_started_event(m
 
 
 @pytest.mark.asyncio
-async def test_action_fetch_collar_observations_exception_sends_error_activity_log(mocker):
+async def test_action_fetch_collar_observations_exception_sends_error_activity_log(mocker, mock_state_manager):
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
     mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
     mock_get_obs.side_effect = Exception("fail")
     result = await action_fetch_collar_observations(integration, config)
     assert result == {"observations_extracted": 0}
@@ -288,7 +300,7 @@ async def test_action_fetch_collar_observations_forbidden_logs_warning(mocker, m
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
     mock_get_obs.side_effect = VectronicForbiddenException(Exception("403"), "Unauthorized access")
     result = await action_fetch_collar_observations(integration, config)
     assert result == {"observations_extracted": 0}
@@ -303,7 +315,7 @@ async def test_action_fetch_collar_observations_not_found_logs_warning(mocker, m
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
     mock_get_obs.side_effect = VectronicNotFoundException(Exception("404"), "Not found")
     result = await action_fetch_collar_observations(integration, config)
     assert result == {"observations_extracted": 0}
@@ -318,7 +330,7 @@ async def test_action_fetch_collar_observations_http_status_error_logs_warning(m
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
     request = httpx.Request("GET", "https://api.vectronic-wildlife.com/v2/collar/1/gps")
     response = httpx.Response(status_code=500, request=request, text="Internal Server Error")
     mock_get_obs.side_effect = httpx.HTTPStatusError("Server error", request=request, response=response)
@@ -346,7 +358,7 @@ async def test_action_fetch_collar_observations_collar_warning_is_throttled(mock
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
     mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=error))
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
 
     result = await action_fetch_collar_observations(integration, config)
 
@@ -369,7 +381,7 @@ async def test_action_fetch_collar_observations_collar_warning_fails_open(mocker
         new=AsyncMock(side_effect=VectronicNotFoundException(Exception("404"), "Not found")),
     )
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
 
     result = await action_fetch_collar_observations(integration, config)
 
@@ -390,7 +402,7 @@ async def test_action_fetch_collar_observations_collar_warning_releases_throttle
         new=AsyncMock(side_effect=VectronicNotFoundException(Exception("404"), "Not found")),
     )
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
 
     with pytest.raises(Exception, match="pubsub down"):
         await action_fetch_collar_observations(integration, config)
@@ -417,12 +429,118 @@ async def test_action_fetch_collar_observations_collar_warning_no_release_when_n
         new=AsyncMock(side_effect=VectronicNotFoundException(Exception("404"), "Not found")),
     )
     integration = MagicMock(id=1, base_url=None)
-    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1, collar_key="K")
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
 
     with pytest.raises(Exception, match="pubsub down"):
         await action_fetch_collar_observations(integration, config)
 
     mock_state_manager.delete_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_resumes_from_saved_cursor(mocker, mock_state_manager):
+    # A redelivered message still carries the 2022 start it was published with.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mock_state_manager.get_state.return_value = async_return({"updated_at": "2026-06-22T18:55:47"})
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[]))
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2022-11-05T05:00:10", collar_id=37590)
+
+    await action_fetch_collar_observations(integration, config)
+
+    assert mock_get_obs.call_args[1]["after_scts"].isoformat() == "2026-06-22T18:55:47+00:00"
+    assert mock_get_obs.call_args[1]["collar_key"] == "K"
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_keeps_newer_message_start(mocker, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mock_state_manager.get_state.return_value = async_return({"updated_at": "2026-01-01T00:00:00"})
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[]))
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2026-10-12T00:00:00", collar_id=1)
+
+    await action_fetch_collar_observations(integration, config)
+
+    assert mock_get_obs.call_args[1]["after_scts"].isoformat() == "2026-10-12T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_saves_cursor_after_each_batch(mocker, mock_state_manager):
+    # The run is cut off after the first batch: its progress is kept, and the
+    # summary is not posted because the second batch never completed.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.OBSERVATION_BATCH_SIZE", 2)
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    obs = [
+        make_observation("2024-01-01T01:00:00", scts="2024-01-02T01:00:00"),
+        make_observation("2024-01-01T02:00:00", latitude=None, scts="2024-01-02T02:00:00"),
+        make_observation("2024-01-01T03:00:00", scts="2024-01-02T03:00:00"),
+        make_observation("2024-01-01T04:00:00", scts="2024-01-02T04:00:00"),
+    ]
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=list(reversed(obs))))
+    mock_send = mocker.patch(
+        "app.actions.handlers.send_observations_to_gundi",
+        new=AsyncMock(side_effect=[[{"object_id": "a"}], Exception("request timeout")]),
+    )
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
+
+    await action_fetch_collar_observations(integration, config)
+
+    # Observations are sent in receive-time order, so the saved cursor is a safe resume point.
+    first_batch = mock_send.call_args_list[0][1]["observations"]
+    assert [o["recorded_at"].hour for o in first_batch] == [1]
+    mock_state_manager.set_state.assert_called_once()
+    assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2024-01-02T02:00:00"}
+    # Only the generic error log; no invalid-location summary for the interrupted run.
+    assert all("invalid location" not in c[1]["title"] for c in mock_log_action_activity.call_args_list)
+
+
+def test_batches_by_receive_time_never_split_a_shared_receive_time():
+    shared = [make_observation(f"2020-07-22T{h:02d}:00:00", scts="2026-06-22T18:55:47") for h in range(5)]
+    later = [make_observation("2020-07-23T00:00:00", scts="2026-06-23T00:00:00")]
+    batches = list(batches_by_receive_time(shared + later, 2))
+    assert [len(b) for b in batches] == [5, 1]
+
+
+def test_get_collar_key_reads_pull_config():
+    files = json.dumps([
+        {"parsedData": {"collarID": "37590", "collarType": "A", "comID": "X", "comType": "Y", "key": "KEY-37590"}},
+        {"parsedData": {"collarID": "46530", "collarType": "A", "comID": "X", "comType": "Y", "key": "KEY-46530"}},
+    ])
+    pull_config = MagicMock(action=MagicMock(value="pull_observations"), data={"files": files})
+    integration = MagicMock(configurations=[pull_config])
+    # Imported before the autouse fixture patches the module attribute, so this is the real lookup.
+    assert get_collar_key(integration, 46530) == "KEY-46530"
+    assert get_collar_key(integration, 99999) is None
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_skips_collar_missing_from_config(mocker, mock_state_manager, collar_key_lookup):
+    collar_key_lookup.return_value = None
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mock_get_obs = mocker.patch("app.actions.handlers.client.get_observations", new_callable=AsyncMock)
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=1)
+
+    result = await action_fetch_collar_observations(integration, config)
+
+    assert result == {"observations_extracted": 0}
+    mock_get_obs.assert_not_awaited()
+
+
+def test_pull_collar_observations_config_ignores_legacy_collar_key():
+    # Messages published before the key was dropped still carry it.
+    config = PullCollarObservationsConfig.parse_obj(
+        {"start": "2024-01-01T00:00:00", "collar_id": 1, "collar_key": "LEGACY"}
+    )
+    assert "collar_key" not in config.dict()
+    assert "LEGACY" not in repr(config)
 
 
 def test_transform_ok():

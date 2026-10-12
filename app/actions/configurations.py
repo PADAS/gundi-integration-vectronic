@@ -25,9 +25,12 @@ class PullObservationsConfig(PullActionConfiguration):
 
 
 class PullCollarObservationsConfig(InternalActionConfiguration):
+    # No collar key: it would travel in every PubSub message, activity event and
+    # log line. The handler looks it up from the integration's pull config.
+    # Messages published before this change still carry `collar_key`; pydantic
+    # ignores the extra field.
     start: datetime
     collar_id: int
-    collar_key: str
 
     @pydantic.validator('start', always=True)
     def parse_time_string(cls, v):

@@ -3,16 +3,17 @@ import logging
 import httpx
 import pydantic
 
+from typing import Optional
+
 import app.actions.client as client
 
 from gundi_core.schemas.v2 import LogLevel
 from datetime import datetime, timedelta, timezone
-from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
+from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig, get_pull_config
 from app.services.action_scheduler import trigger_actions
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import send_observations_to_gundi
 from app.services.state import IntegrationStateManager
-from app.services.utils import generate_batches
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,9 @@ COLLAR_WARNING_THROTTLE_SECONDS = 3600
 
 # How many skipped observations to attach to the invalid-location summary.
 INVALID_OBSERVATION_SAMPLE_SIZE = 3
+
+# Observations sent to Gundi per request; the cursor is saved after each one.
+OBSERVATION_BATCH_SIZE = 200
 
 
 class CollarData(pydantic.BaseModel):
@@ -110,7 +114,7 @@ async def log_throttled_collar_warning(integration_id, collar_id, kind: str, tit
 
 @activity_logger()
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
-    logger.info(f"Executing 'pull_observations' action with integration ID {integration.id} and action_config {action_config}...")
+    logger.info(f"Executing 'pull_observations' action with integration ID {integration.id}...")
 
     collars_triggered = 0
 
@@ -118,11 +122,11 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         # Turn string JSON into list of dicts
         collars = json.loads(action_config.files)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode collars JSON for integration ID {integration.id} and action_config {action_config}: {e}")
+        logger.error(f"Failed to decode collars JSON for integration ID {integration.id}: {e}")
         raise e
 
     if not collars:
-        logger.warning(f"No valid collars found for integration ID {integration.id} and action_config {action_config}")
+        logger.warning(f"No valid collars found for integration ID {integration.id}")
         return {"status": "success", "collars_triggered": 0}
 
     try:
@@ -146,7 +150,6 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             collar_configs.append(PullCollarObservationsConfig(
                 start=start,
                 collar_id=int(parsed_collar.collar_id),
-                collar_key=parsed_collar.key
             ))
         # One batched publish for the whole list: one PubSub round trip per
         # collar (each with its own session and token) overran Cloud Run's
@@ -159,10 +162,58 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         collars_triggered = len(collar_configs)
 
     except Exception as e:
-        logger.error(f"Failed to process collars from integration ID {integration.id} and action_config {action_config}")
+        logger.error(f"Failed to process collars from integration ID {integration.id}")
         raise e
 
     return {"status": "success", "collars_triggered": collars_triggered}
+
+
+def get_collar_key(integration, collar_id: int) -> Optional[str]:
+    collars = json.loads(get_pull_config(integration).files)
+    for collar in collars:
+        parsed_collar = CollarData.parse_obj(collar["parsedData"])
+        if parsed_collar.collar_id == str(collar_id):
+            return parsed_collar.key
+    return None
+
+
+def receive_time(observation) -> datetime:
+    # afterScts filters on scts, so the cursor and ordering use it too.
+    return observation.scts or observation.acquisition_time
+
+
+def batches_by_receive_time(observations, size: int):
+    """Yield batches of about `size` observations sorted by receive time,
+    never splitting fixes that share one. The cursor saved after a batch
+    then never falls inside a group of fixes that is only partly processed."""
+    batch = []
+    for ob in observations:
+        if len(batch) >= size and receive_time(ob) != receive_time(batch[-1]):
+            yield batch
+            batch = []
+        batch.append(ob)
+    if batch:
+        yield batch
+
+
+async def get_saved_cursor(integration_id, collar_id: int) -> Optional[datetime]:
+    state = await state_manager.get_state(
+        integration_id=integration_id,
+        action_id="pull_observations",
+        source_id=str(collar_id)
+    )
+    if not state or not state.get("updated_at"):
+        return None
+    return datetime.fromisoformat(state["updated_at"]).replace(tzinfo=timezone.utc)
+
+
+async def save_cursor(integration_id, collar_id: int, cursor: datetime):
+    await state_manager.set_state(
+        integration_id=integration_id,
+        action_id="pull_observations",
+        state={"updated_at": cursor.strftime("%Y-%m-%dT%H:%M:%S")},
+        source_id=str(collar_id)
+    )
 
 
 # No "started" event: this runs once per collar per schedule tick, and a
@@ -172,75 +223,84 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
     logger.info(f"Executing 'fetch_collar_observations' action with integration ID {integration.id} and action_config {action_config}...")
 
     base_url = integration.base_url or VECTRONIC_BASE_URL
-    transformed_data = []
     observations_extracted = 0
 
     try:
-        observations = await client.get_observations(integration, base_url, action_config)
+        collar_key = get_collar_key(integration, action_config.collar_id)
+        if not collar_key:
+            logger.warning(
+                f"Collar {action_config.collar_id} is no longer in the configuration of integration {integration.id}. Skipping."
+            )
+            return {"observations_extracted": 0}
+
+        # A redelivered or long-queued message carries the start from when it
+        # was published. Resume from the saved cursor if it has moved past it.
+        start = action_config.start
+        saved_cursor = await get_saved_cursor(integration.id, action_config.collar_id)
+        if saved_cursor and saved_cursor > start:
+            start = saved_cursor
+
+        observations = await client.get_observations(
+            base_url=base_url,
+            collar_id=action_config.collar_id,
+            collar_key=collar_key,
+            after_scts=start,
+        )
         # The cursor is the latest scts already processed. If afterScts is
         # inclusive, fixes received at exactly the cursor come back on every
         # run, so drop anything at or before it.
-        observations = [ob for ob in observations if ob.scts is None or ob.scts > action_config.start]
-        if observations:
-            logger.info(f"Extracted {len(observations)} observations for collar {action_config.collar_id}")
+        observations = sorted(
+            (ob for ob in observations if ob.scts is None or ob.scts > start),
+            key=receive_time,
+        )
+        if not observations:
+            return {"observations_extracted": 0}
 
-            invalid_observations = []
-            for ob in observations:
+        logger.info(f"Extracted {len(observations)} observations for collar {action_config.collar_id}")
+
+        invalid_observations = []
+        for i, batch in enumerate(batches_by_receive_time(observations, OBSERVATION_BATCH_SIZE)):
+            transformed_data = []
+            for ob in batch:
                 if ob.latitude is None or ob.longitude is None:
                     logger.warning(f"Collar ID {ob.id_collar} got an invalid observation (location is invalid). Skipping...")
                     invalid_observations.append(ob)
                     continue
                 transformed_data.append(transform(ob))
 
-            if invalid_observations:
-                # One summary per collar per run rather than one entry per fix.
-                # Best-effort: each skip is already in the application log, and a
-                # publish failure must not block delivery or the cursor update below.
-                try:
-                    await log_action_activity(
-                        integration_id=integration.id,
-                        action_id="fetch_collar_observations",
-                        level=LogLevel.WARNING,
-                        title=f"Collar ID {action_config.collar_id}: skipped {len(invalid_observations)} observation(s) with an invalid location.",
-                        data={
-                            "skipped_count": len(invalid_observations),
-                            "sample_observations": [ob.dict() for ob in invalid_observations[:INVALID_OBSERVATION_SAMPLE_SIZE]],
-                        }
-                    )
-                except Exception as log_error:
-                    logger.warning(
-                        f"Could not publish the invalid-observation summary for collar {action_config.collar_id} "
-                        f"(integration '{integration.id}'): {log_error}"
-                    )
-
-            for i, batch in enumerate(generate_batches(transformed_data, 200)):
-                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Collar: {action_config.collar_id}')
-                response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
+            if transformed_data:
+                logger.info(f'Sending observations batch #{i}: {len(transformed_data)} observations. Collar: {action_config.collar_id}')
+                response = await send_observations_to_gundi(observations=transformed_data, integration_id=integration.id)
                 observations_extracted += len(response)
 
-            # Advance the cursor past every returned observation, including
-            # skipped ones; otherwise a run that only sees invalid fixes
-            # re-fetches (and re-reports) the same fixes on every run.
-            # The query filters by receive time (afterScts), so the cursor must
-            # be receive time too: late-uploaded fixes can have acquisition
-            # times years older than when they arrived. Fall back to acquisition
-            # time if scts is missing, and never let the cursor move backward.
-            latest_time = max(
-                max(obs.scts or obs.acquisition_time for obs in observations),
-                action_config.start,
-            )
-            state = {"updated_at": latest_time.strftime("%Y-%m-%dT%H:%M:%S")}
+            # Save progress after every batch, skipped fixes included. A run
+            # cut off by the request timeout then resumes here on redelivery
+            # instead of re-sending everything from the old start.
+            await save_cursor(integration.id, action_config.collar_id, max(receive_time(batch[-1]), start))
 
-            await state_manager.set_state(
-                integration_id=integration.id,
-                action_id="pull_observations",
-                state=state,
-                source_id=str(action_config.collar_id)
-            )
+        if invalid_observations:
+            # One summary per collar per run rather than one entry per fix,
+            # posted only once the cursor covers these fixes so an interrupted
+            # attempt cannot post it again. Best-effort: each skip is already
+            # in the application log.
+            try:
+                await log_action_activity(
+                    integration_id=integration.id,
+                    action_id="fetch_collar_observations",
+                    level=LogLevel.WARNING,
+                    title=f"Collar ID {action_config.collar_id}: skipped {len(invalid_observations)} observation(s) with an invalid location.",
+                    data={
+                        "skipped_count": len(invalid_observations),
+                        "sample_observations": [ob.dict() for ob in invalid_observations[:INVALID_OBSERVATION_SAMPLE_SIZE]],
+                    }
+                )
+            except Exception as log_error:
+                logger.warning(
+                    f"Could not publish the invalid-observation summary for collar {action_config.collar_id} "
+                    f"(integration '{integration.id}'): {log_error}"
+                )
 
-            return {"observations_extracted": observations_extracted}
-        else:
-            return {"observations_extracted": 0}
+        return {"observations_extracted": observations_extracted}
     except client.VectronicForbiddenException as e:
         message = f"Unauthorized response from Vectronic with integration {integration.id} using {action_config}. Exception: {e}"
         logger.warning(message)
