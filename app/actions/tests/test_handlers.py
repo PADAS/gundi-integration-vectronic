@@ -21,7 +21,7 @@ from app.actions.handlers import (
 )
 from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
 from app.conftest import async_return
-from app.services.redaction import redact_secrets, secret_field_names
+from app.services.redaction import redact_secrets, redact_text, redact_url, secret_field_names
 
 
 @pytest.fixture(autouse=True)
@@ -687,3 +687,17 @@ def test_collar_data_parsing_error():
     with pytest.raises(ValidationError) as exc_info:
         CollarData.parse_obj(data)
     assert "collarID" in str(exc_info.value)
+
+
+def test_template_redaction_masks_the_collar_key():
+    # Vectronic takes the collar key as a query parameter. The template's
+    # failure-event redaction (request_url, error text, traceback) must treat
+    # it as a secret, like api_key; client.py's own masking only covers the
+    # messages it rewrites, not the request still attached to the error.
+    url = "https://api.vectronic-wildlife.com/v2/collar/1/gps?collarkey=SECRETKEY123&afterScts=2024-01-01T00%3A00%3A00"
+    assert "SECRETKEY123" not in redact_url(url)
+    assert "afterScts=2024-01-01T00%3A00%3A00" in redact_url(url)
+    message = f"Server error '500 Internal Server Error' for url '{url}'"
+    assert "SECRETKEY123" not in redact_text(message)
+    # Messages published before the key left PubSub still carry collar_key.
+    assert redact_secrets({"collar_id": 1, "collar_key": "SECRETKEY123"}) == {"collar_id": 1, "collar_key": "**********"}

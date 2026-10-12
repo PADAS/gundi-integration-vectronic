@@ -60,6 +60,10 @@ SENSITIVE_KEY_FRAGMENTS = (
     "private_key",
     "authorization",
     "credential",
+    # Fork addition (gundi-integration-vectronic): Vectronic's collar key, a
+    # query parameter on every collar request.
+    "collarkey",
+    "collar_key",
 )
 
 _SECRET_TYPES = (pydantic.SecretStr, pydantic.SecretBytes)
