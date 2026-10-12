@@ -720,3 +720,36 @@ async def test_action_fetch_collar_observations_completion_entry_failure_does_no
     # The observations are already in Gundi and the cursor is saved.
     assert result == {"observations_extracted": 1}
     assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2024-01-01T01:00:00"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    Exception("gundi down"),
+    httpx.HTTPStatusError(
+        "Server error",
+        request=httpx.Request("POST", "https://gundi.example/v2/observations/"),
+        response=httpx.Response(status_code=502, request=httpx.Request("POST", "https://gundi.example/v2/observations/")),
+    ),
+])
+async def test_action_fetch_collar_observations_reports_what_was_sent_before_a_failure(mocker, mock_state_manager, error):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.OBSERVATION_BATCH_SIZE", 2)
+    observations = [make_observation(f"2024-01-01T0{i}:00:00", collar_id=123) for i in range(1, 5)]
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=observations))
+    # The first checkpoint reaches Gundi; the second request fails.
+    mocker.patch(
+        "app.actions.handlers.send_observations_to_gundi",
+        new=AsyncMock(side_effect=[[{"object_id": "a"}, {"object_id": "b"}], error]),
+    )
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
+
+    result = await action_fetch_collar_observations(integration, config)
+
+    assert result == {"observations_extracted": 2}
+    titles = [c[1]["title"] for c in mock_log_action_activity.call_args_list]
+    assert titles[-1] == "Collar ID 123: sent 2 observation(s) to Gundi."
+    # The failure is still reported, before the entry for what was sent.
+    assert len(titles) == 2
