@@ -22,6 +22,7 @@ from app.actions.handlers import (
 )
 from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
 from app.conftest import async_return
+from app.services.redaction import redact_secrets, redact_text, redact_url, secret_field_names
 
 
 @pytest.fixture(autouse=True)
@@ -621,6 +622,16 @@ def test_pull_observations_config_keeps_collar_keys_out_of_events_and_repr():
     assert "files" in PullObservationsConfig.schema()["properties"]
 
 
+def test_pull_observations_config_declares_collar_keys_secret_for_redaction():
+    # Second layer behind exclude=True: anything that serializes the raw
+    # configuration (e.g. a configuration row on a failure event) masks it too.
+    files = json.dumps([{"parsedData": {"collarID": "1", "key": "SECRETKEY123"}}])
+    assert PullObservationsConfig.schema()["properties"]["files"]["writeOnly"] is True
+    assert "files" in secret_field_names(PullObservationsConfig)
+    redacted = redact_secrets({"files": files, "default_lookback_hours": 12}, model=PullObservationsConfig)
+    assert redacted == {"files": "**********", "default_lookback_hours": 12}
+
+
 def test_transform_ok():
     obj = {
         "idCollar": "1",
@@ -798,3 +809,17 @@ async def test_action_fetch_collar_observations_cancelled_run_skips_the_sent_ent
         await action_fetch_collar_observations(integration, config)
 
     mock_log_action_activity.assert_not_awaited()
+
+
+def test_template_redaction_masks_the_collar_key():
+    # Vectronic takes the collar key as a query parameter. The template's
+    # failure-event redaction (request_url, error text, traceback) must treat
+    # it as a secret, like api_key; client.py's own masking only covers the
+    # messages it rewrites, not the request still attached to the error.
+    url = "https://api.vectronic-wildlife.com/v2/collar/1/gps?collarkey=SECRETKEY123&afterScts=2024-01-01T00%3A00%3A00"
+    assert "SECRETKEY123" not in redact_url(url)
+    assert "afterScts=2024-01-01T00%3A00%3A00" in redact_url(url)
+    message = f"Server error '500 Internal Server Error' for url '{url}'"
+    assert "SECRETKEY123" not in redact_text(message)
+    # Messages published before the key left PubSub still carry collar_key.
+    assert redact_secrets({"collar_id": 1, "collar_key": "SECRETKEY123"}) == {"collar_id": 1, "collar_key": "**********"}
