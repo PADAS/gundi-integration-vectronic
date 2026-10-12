@@ -38,7 +38,9 @@ class VectronicObservation(pydantic.BaseModel):
             return v
         if not v.tzinfo:
             return v.replace(tzinfo=timezone.utc)
-        return v
+        # The cursor is stored without an offset and reloaded as UTC, so any
+        # offset must be converted here or the cursor shifts by that offset.
+        return v.astimezone(timezone.utc)
 
 
 class VectronicNotFoundException(Exception):
