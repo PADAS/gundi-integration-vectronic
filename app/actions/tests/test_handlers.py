@@ -147,6 +147,23 @@ async def test_action_fetch_collar_observations_advances_cursor_when_all_invalid
 
 
 @pytest.mark.asyncio
+async def test_action_fetch_collar_observations_cursor_never_moves_backward(mocker, mock_state_manager):
+    # A late-uploaded fix passes the afterScts filter but has an acquisition
+    # time older than the current cursor; keeping it would widen the next query.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2026-10-12T00:00:00", collar_id=123, collar_key="K")
+    late_ob = make_observation("2022-09-26T16:01:39", latitude=None, longitude=None)
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[late_ob]))
+
+    await action_fetch_collar_observations(integration, config)
+
+    assert mock_state_manager.set_state.call_args[1]["state"] == {"updated_at": "2026-10-12T00:00:00"}
+
+
+@pytest.mark.asyncio
 async def test_action_fetch_collar_observations_mixed_valid_and_invalid(mocker, mock_state_manager):
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     integration = MagicMock(id=1, base_url=None)

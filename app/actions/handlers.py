@@ -189,7 +189,13 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             # Advance the cursor past every returned observation, including
             # skipped ones; otherwise a run that only sees invalid fixes
             # re-fetches (and re-reports) the same fixes on every run.
-            latest_time = max(observations, key=lambda obs: obs.acquisition_time).acquisition_time
+            # The query filters by receive time (afterScts) but the cursor is
+            # acquisition time, so a late-uploaded fix can be older than the
+            # current start; never let the cursor move backward.
+            latest_time = max(
+                max(obs.acquisition_time for obs in observations),
+                action_config.start,
+            )
             state = {"updated_at": latest_time.strftime("%Y-%m-%dT%H:%M:%S")}
 
             await state_manager.set_state(
