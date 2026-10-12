@@ -43,7 +43,7 @@ class CollarData(pydantic.BaseModel):
 
 def transform(observation):
     additional_info = {
-        key: value for key, value in observation.dict().items() if value and key not in ["id_collar", "acquisition_time", "latitude", "longitude"]
+        key: value for key, value in observation.dict().items() if value and key not in ["id_collar", "acquisition_time", "scts", "latitude", "longitude"]
     }
 
     return {
@@ -217,11 +217,12 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             # Advance the cursor past every returned observation, including
             # skipped ones; otherwise a run that only sees invalid fixes
             # re-fetches (and re-reports) the same fixes on every run.
-            # The query filters by receive time (afterScts) but the cursor is
-            # acquisition time, so a late-uploaded fix can be older than the
-            # current start; never let the cursor move backward.
+            # The query filters by receive time (afterScts), so the cursor must
+            # be receive time too: late-uploaded fixes can have acquisition
+            # times years older than when they arrived. Fall back to acquisition
+            # time if scts is missing, and never let the cursor move backward.
             latest_time = max(
-                max(obs.acquisition_time for obs in observations),
+                max(obs.scts or obs.acquisition_time for obs in observations),
                 action_config.start,
             )
             state = {"updated_at": latest_time.strftime("%Y-%m-%dT%H:%M:%S")}
