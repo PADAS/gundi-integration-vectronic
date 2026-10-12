@@ -14,6 +14,7 @@ from app.services.action_scheduler import trigger_actions
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import send_observations_to_gundi
 from app.services.state import IntegrationStateManager
+from app.services.utils import generate_batches
 
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ COLLAR_WARNING_THROTTLE_SECONDS = 3600
 # How many skipped observations to attach to the invalid-location summary.
 INVALID_OBSERVATION_SAMPLE_SIZE = 3
 
-# Observations sent to Gundi per request; the cursor is saved after each one.
+# Max observations per request to Gundi; larger requests time out (HTTP 504).
 OBSERVATION_BATCH_SIZE = 200
 
 
@@ -182,10 +183,12 @@ def receive_time(observation) -> datetime:
     return observation.scts or observation.acquisition_time
 
 
-def batches_by_receive_time(observations, size: int):
-    """Yield batches of about `size` observations sorted by receive time,
-    never splitting fixes that share one. The cursor saved after a batch
-    then never falls inside a group of fixes that is only partly processed."""
+def checkpoints_by_receive_time(observations, size: int):
+    """Yield groups of at least `size` observations (sorted by receive time),
+    never splitting fixes that share one, so the cursor saved after a group
+    never falls inside a partly processed set. A bulk upload can share one
+    receive time across thousands of fixes, so a group can be far larger
+    than `size`; callers must still send it in requests of at most `size`."""
     batch = []
     for ob in observations:
         if len(batch) >= size and receive_time(ob) != receive_time(batch[-1]):
@@ -266,24 +269,26 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         logger.info(f"Extracted {len(observations)} observations for collar {action_config.collar_id}")
 
         invalid_observations = []
-        for i, batch in enumerate(batches_by_receive_time(observations, OBSERVATION_BATCH_SIZE)):
+        batch_number = 0
+        for checkpoint in checkpoints_by_receive_time(observations, OBSERVATION_BATCH_SIZE):
             transformed_data = []
-            for ob in batch:
+            for ob in checkpoint:
                 if ob.latitude is None or ob.longitude is None:
                     logger.warning(f"Collar ID {ob.id_collar} got an invalid observation (location is invalid). Skipping...")
                     invalid_observations.append(ob)
                     continue
                 transformed_data.append(transform(ob))
 
-            if transformed_data:
-                logger.info(f'Sending observations batch #{i}: {len(transformed_data)} observations. Collar: {action_config.collar_id}')
-                response = await send_observations_to_gundi(observations=transformed_data, integration_id=integration.id)
+            for batch in generate_batches(transformed_data, OBSERVATION_BATCH_SIZE):
+                logger.info(f'Sending observations batch #{batch_number}: {len(batch)} observations. Collar: {action_config.collar_id}')
+                response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
                 observations_extracted += len(response)
+                batch_number += 1
 
-            # Save progress after every batch, skipped fixes included. A run
-            # cut off by the request timeout then resumes here on redelivery
-            # instead of re-sending everything from the old start.
-            await save_cursor(integration.id, action_config.collar_id, max(receive_time(batch[-1]), start))
+            # Save progress after every checkpoint, skipped fixes included. A
+            # run cut off by the request timeout then resumes here on
+            # redelivery instead of re-sending everything from the old start.
+            await save_cursor(integration.id, action_config.collar_id, max(receive_time(checkpoint[-1]), start))
 
         if invalid_observations:
             # One summary per collar per run rather than one entry per fix,
