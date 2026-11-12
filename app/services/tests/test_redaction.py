@@ -524,17 +524,47 @@ def test_redact_text_leaves_text_without_secret_pairs_as_is():
     assert redact_text(None) == ""
 
 
+def test_redact_url_masks_the_userinfo():
+    # Basic-auth credentials in the URL itself reach request_url, the
+    # exception text and the traceback exactly like a secret query parameter.
+    assert redact_url("https://user:p%40ss@api.example.com/v1/items?page=2") == (
+        f"https://{REDACTED}@api.example.com/v1/items?page=2"
+    )
+    # A bare token before the "@" (basic auth with an empty password) is the
+    # credential; mask it even though it is "only a username".
+    assert redact_url("https://k-999@api.example.com:8443/v1/items") == (
+        f"https://{REDACTED}@api.example.com:8443/v1/items"
+    )
+    assert redact_url("https://user:secret@api.example.com/v1/items?api_key=k123&page=2") == (
+        f"https://{REDACTED}@api.example.com/v1/items?api_key={REDACTED}&page=2"
+    )
+    assert redact_url("https://api.example.com/v1/items?page=2") == "https://api.example.com/v1/items?page=2"
+
+
+def test_redact_text_masks_the_userinfo_of_a_url_quoted_in_free_text():
+    text = "Client error '401 Unauthorized' for url 'https://user:secret@api.example.com/v1/items'"
+
+    assert redact_text(text) == (
+        f"Client error '401 Unauthorized' for url 'https://{REDACTED}@api.example.com/v1/items'"
+    )
+
+
 def test_redact_url_masks_a_url_it_cannot_parse_instead_of_raising():
-    assert redact_url("https://[broken]?token=abc") == REDACTED
+    # An unbalanced bracket is rejected by urlsplit on every supported
+    # Python. A balanced one around a non-address host ("[broken]") is
+    # rejected only by 3.11+ and 3.10's later security releases (CI's
+    # 3.10.22 yes, uv's 3.10.14 no); where it parses, only the query gets
+    # masked and the except branch is never reached.
+    assert redact_url("https://[broken?token=abc") == REDACTED
 
 
 def test_redact_text_masks_a_malformed_url_whole_and_never_raises():
     # Redaction runs inside the runner's error handling: raising there
     # would lose the failure event and the structured response.
-    assert redact_text("Client error for url 'https://[broken]?token=abc' (HTTP 403)") == (
+    assert redact_text("Client error for url 'https://[broken?token=abc' (HTTP 403)") == (
         f"Client error for url '{REDACTED}' (HTTP 403)"
     )
-    assert redact_text("https://[broken]?token=abc then page=2") == f"{REDACTED} then page=2"
+    assert redact_text("https://[broken?token=abc then page=2") == f"{REDACTED} then page=2"
 
 
 def test_redact_text_masks_the_whole_value_of_a_sensitive_key():
