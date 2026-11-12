@@ -14,9 +14,11 @@ from datetime import datetime, timedelta, timezone
 from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig, get_pull_config
 from app.services.action_scheduler import trigger_actions
 from app.services.activity_logger import activity_logger, log_action_activity
+from app.services.errors import source_status_code
 from app.services.gundi import send_observations_to_gundi
 from app.services.state import IntegrationStateManager
 from app.services.utils import generate_batches
+from gundi_client_v2.errors import AuthenticationError, GundiAPIError
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,11 @@ VECTRONIC_BASE_URL = "https://api.vectronic-wildlife.com"
 # per window per collar. The local application log still records every run.
 COLLAR_WARNING_THROTTLE_SECONDS = 3600
 
+# A timeout, dropped connection or Vectronic server error is a warning until
+# the collar has gone this long without a successful pull, then an error, so a
+# lasting outage still marks the integration unhealthy. Same rule as Lotek.
+ESCALATION_AFTER = timedelta(hours=1)
+
 # How many skipped observations to attach to the invalid-location summary.
 INVALID_OBSERVATION_SAMPLE_SIZE = 3
 
@@ -38,12 +45,37 @@ OBSERVATION_BATCH_SIZE = 200
 
 
 class GundiDeliveryError(Exception):
-    """Gundi rejected a batch of observations. Kept apart from the collar
-    API's httpx errors so it is not reported, or throttled, as Vectronic's."""
+    """Gundi rejected a batch of observations or could not be reached. Kept
+    apart from the collar API's httpx errors so it is not reported, or
+    throttled, as Vectronic's."""
 
-    def __init__(self, error: httpx.HTTPStatusError):
-        self.status_code = error.response.status_code
-        super().__init__(str(error))
+    def __init__(self, error: Exception, reason: str):
+        self.reason = reason
+        super().__init__(error_detail(error))
+
+
+def error_reason(error: Exception) -> str:
+    """The error's own text, never empty: timeouts have no text, so fall
+    back to the exception type rather than a blank reason."""
+    return str(error).strip() or type(error).__name__
+
+
+def error_detail(error: Exception) -> str:
+    """Technical detail for the application log."""
+    return f"{type(error).__name__}: {error_reason(error)}"
+
+
+def gundi_failure_reason(error: Exception) -> str:
+    """Why Gundi didn't take a batch, as the end of a "because ..." sentence."""
+    if isinstance(error, httpx.TimeoutException):
+        return "the connection to Gundi timed out"
+    if isinstance(error, httpx.TransportError) or getattr(error, "transport", False):
+        # AuthenticationError.transport: the sign-in endpoint never answered.
+        return "the connection to Gundi failed"
+    if isinstance(error, AuthenticationError):
+        return "Gundi didn't accept the integration's sign-in"
+    status_code = source_status_code(error)
+    return f"Gundi answered with error {status_code}" if status_code else "Gundi answered with an error"
 
 
 class CollarData(pydantic.BaseModel):
@@ -78,7 +110,7 @@ def transform(observation):
     }
 
 
-async def log_throttled_collar_warning(integration_id, collar_id, kind: str, title: str, data: dict = None):
+async def log_throttled_collar_warning(integration_id, collar_id, kind: str, title: str, data: dict = None, level: LogLevel = LogLevel.WARNING):
     throttle_key = f"{kind}-warning-{collar_id}"
     reserved = False
     try:
@@ -102,7 +134,7 @@ async def log_throttled_collar_warning(integration_id, collar_id, kind: str, tit
             await log_action_activity(
                 integration_id=integration_id,
                 action_id="fetch_collar_observations",
-                level=LogLevel.WARNING,
+                level=level,
                 title=title,
                 data=data,
             )
@@ -257,6 +289,67 @@ async def log_sent_observations(integration_id, collar_id: int, count: int):
         )
 
 
+async def log_collar_problem(integration, action_config, kind: str, title: str, level: LogLevel = LogLevel.WARNING, **extra):
+    """Throttled entry for one collar. The title says in plain words what
+    didn't happen and why; the message repeats it for the portal's detail view."""
+    await log_throttled_collar_warning(
+        integration_id=integration.id,
+        collar_id=action_config.collar_id,
+        kind=kind,
+        title=title,
+        data={"message": title, **extra, "data": action_config},
+        level=level,
+    )
+
+
+async def save_last_pull(integration_id, collar_id: int, at: datetime):
+    await state_manager.set_state(
+        integration_id=integration_id,
+        action_id="fetch_collar_observations",
+        state={"at": at.isoformat()},
+        source_id=f"last-pull-{collar_id}",
+    )
+
+
+async def mark_pull_succeeded(integration_id, collar_id: int):
+    # Best-effort: losing this only delays an escalation, never fails the run.
+    try:
+        await save_last_pull(integration_id, collar_id, datetime.now(timezone.utc))
+    except Exception as e:
+        logger.warning(f"Could not save the last successful pull for collar {collar_id} (integration '{integration_id}'): {error_detail(e)}")
+
+
+async def outage_is_escalated(integration_id, collar_id: int) -> bool:
+    """True once the collar has gone ESCALATION_AFTER without a successful
+    pull. A collar with no record yet (new, or from before this rule) starts
+    its clock at this failure, so a collar that never succeeds still escalates."""
+    try:
+        state = await state_manager.get_state(
+            integration_id=integration_id,
+            action_id="fetch_collar_observations",
+            source_id=f"last-pull-{collar_id}",
+        )
+        now = datetime.now(timezone.utc)
+        if not state or not state.get("at"):
+            await save_last_pull(integration_id, collar_id, now)
+            return False
+        return now - datetime.fromisoformat(state["at"]) >= ESCALATION_AFTER
+    except Exception as e:
+        logger.warning(f"Could not read the last successful pull for collar {collar_id} (integration '{integration_id}'): {error_detail(e)}")
+        return False
+
+
+async def log_vectronic_outage(integration, action_config, kind: str, warning_title: str, escalated_title: str):
+    """A temporary Vectronic problem: a warning at first, an error once the
+    collar has gone ESCALATION_AFTER without a successful pull."""
+    if await outage_is_escalated(integration.id, action_config.collar_id):
+        # One shared kind: at most one ERROR per collar per hour, whichever
+        # mix of timeouts, connection failures and server errors caused it.
+        await log_collar_problem(integration, action_config, kind="outage-escalated", title=escalated_title, level=LogLevel.ERROR)
+    else:
+        await log_collar_problem(integration, action_config, kind=kind, title=warning_title)
+
+
 # No "started" or generic "completed" event: this runs once per collar per
 # schedule tick, and an entry per collar per run flooded the activity log for
 # large integrations. Nothing in Gundi reads the "completed" event (integration
@@ -291,6 +384,7 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
             collar_key=collar_key,
             after_scts=start,
         )
+        await mark_pull_succeeded(integration.id, action_config.collar_id)
         # The cursor is the latest scts already processed. If afterScts is
         # inclusive, fixes received at exactly the cursor come back on every
         # run, so drop anything at or before it.
@@ -318,8 +412,9 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
                 logger.info(f'Sending observations batch #{batch_number}: {len(batch)} observations. Collar: {action_config.collar_id}')
                 try:
                     response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
-                except httpx.HTTPStatusError as e:
-                    raise GundiDeliveryError(e) from e
+                except (GundiAPIError, AuthenticationError, httpx.HTTPStatusError, httpx.TransportError) as e:
+                    # gundi-client-v2 3.x wraps Gundi's 4xx/5xx in GundiAPIError.
+                    raise GundiDeliveryError(e, gundi_failure_reason(e)) from e
                 observations_extracted += len(response)
                 batch_number += 1
 
@@ -352,64 +447,75 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
 
         return {"observations_extracted": observations_extracted}
     except client.VectronicForbiddenException as e:
-        message = f"Unauthorized response from Vectronic with integration {integration.id} using {action_config}. Exception: {e}"
-        logger.warning(message)
-        await log_throttled_collar_warning(
-            integration_id=integration.id,
-            collar_id=action_config.collar_id,
-            kind="unauthorized",
-            title="Unauthorized access (bad collar key and/or collar ID)",
-            data={"message": message, "data": action_config}
+        logger.warning(f"Vectronic refused collar {action_config.collar_id} (integration {integration.id}): {error_detail(e)}")
+        await log_collar_problem(
+            integration, action_config, kind="unauthorized",
+            title=f"Vectronic didn't send data for collar {action_config.collar_id} because it didn't accept the collar ID and key.",
         )
         return {"observations_extracted": observations_extracted}
     except client.VectronicNotFoundException as e:
-        message = f"Collar ID {action_config.collar_id} not found. Integration {integration.id} using {action_config}. Exception: {e}"
-        logger.warning(message)
-        await log_throttled_collar_warning(
-            integration_id=integration.id,
-            collar_id=action_config.collar_id,
-            kind="not-found",
-            title=f"Collar ID {action_config.collar_id} not found.",
-            data={"message": message, "data": action_config}
+        logger.warning(f"Vectronic doesn't know collar {action_config.collar_id} (integration {integration.id}): {error_detail(e)}")
+        await log_collar_problem(
+            integration, action_config, kind="not-found",
+            title=f"Vectronic didn't send data for collar {action_config.collar_id} because it doesn't know this collar ID.",
         )
         return {"observations_extracted": observations_extracted}
     except GundiDeliveryError as e:
-        message = (
-            f"Gundi returned HTTP {e.status_code} while sending observations for collar {action_config.collar_id} "
-            f"from integration ID {integration.id}, after {observations_extracted} were sent. Exception: {e}"
+        logger.warning(
+            f"Sending observations for collar {action_config.collar_id} to Gundi failed "
+            f"(integration {integration.id}) after {observations_extracted} were sent: {e}"
         )
-        logger.warning(message)
-        await log_throttled_collar_warning(
-            integration_id=integration.id,
-            collar_id=action_config.collar_id,
-            kind="gundi-error",
-            title=f"Gundi returned HTTP {e.status_code} while sending observations for collar {action_config.collar_id}.",
-            data={"message": message, "data": action_config}
+        await log_collar_problem(
+            integration, action_config, kind="gundi-error",
+            title=f"Observations for collar {action_config.collar_id} didn't reach Gundi because {e.reason}.",
+            observations_sent=observations_extracted,
         )
         return {"observations_extracted": observations_extracted}
     except httpx.HTTPStatusError as e:
         # Other 4xx/5xx responses from the collar API (403/404 are handled above).
-        # These are upstream/transient conditions, not integration errors, so log as a warning.
         status_code = e.response.status_code
-        message = f"Vectronic returned HTTP {status_code} for collar {action_config.collar_id} from integration ID {integration.id}. Exception: {e}"
-        logger.warning(message)
-        await log_throttled_collar_warning(
-            integration_id=integration.id,
-            collar_id=action_config.collar_id,
-            kind="http-error",
-            title=f"Vectronic returned HTTP {status_code} for collar {action_config.collar_id}.",
-            data={"message": message, "data": action_config}
+        logger.warning(f"Vectronic returned HTTP {status_code} for collar {action_config.collar_id} (integration {integration.id}): {error_detail(e)}")
+        if status_code >= 500 or status_code == 429:
+            # Vectronic down or throttling: temporary, escalates like a timeout.
+            await log_vectronic_outage(
+                integration, action_config, kind="http-error",
+                warning_title=f"Vectronic didn't send data for collar {action_config.collar_id} because its server answered with error {status_code}.",
+                escalated_title=f"Vectronic hasn't sent data for collar {action_config.collar_id} for over 1 hour because its server keeps answering with errors (latest: {status_code}).",
+            )
+        else:
+            # A rejected request, not an outage.
+            await log_collar_problem(
+                integration, action_config, kind="request-rejected",
+                title=f"Vectronic didn't send data for collar {action_config.collar_id} because it rejected the request with error {status_code}.",
+            )
+        return {"observations_extracted": observations_extracted}
+    except httpx.TimeoutException as e:
+        logger.warning(f"Vectronic timed out for collar {action_config.collar_id} (integration {integration.id}): {error_detail(e)}")
+        await log_vectronic_outage(
+            integration, action_config, kind="timeout",
+            warning_title=f"Vectronic didn't send data for collar {action_config.collar_id} because the connection timed out.",
+            escalated_title=f"Vectronic hasn't sent data for collar {action_config.collar_id} for over 1 hour because the connection keeps timing out.",
+        )
+        return {"observations_extracted": observations_extracted}
+    except httpx.TransportError as e:
+        logger.warning(f"Connection to Vectronic failed for collar {action_config.collar_id} (integration {integration.id}): {error_detail(e)}")
+        await log_vectronic_outage(
+            integration, action_config, kind="connection",
+            warning_title=f"Vectronic didn't send data for collar {action_config.collar_id} because the connection to Vectronic failed.",
+            escalated_title=f"Vectronic hasn't sent data for collar {action_config.collar_id} for over 1 hour because the connection to Vectronic keeps failing.",
         )
         return {"observations_extracted": observations_extracted}
     except Exception as e:
-        message = f"Failed to fetch observations for collar {action_config.collar_id} from integration ID {integration.id}. Exception: {e}"
-        logger.exception(message)
+        logger.exception(
+            f"Failed to fetch observations for collar {action_config.collar_id} from integration ID {integration.id}: {error_detail(e)}"
+        )
+        title = f"Observations for collar {action_config.collar_id} didn't come through because of an unexpected problem."
         await log_action_activity(
             integration_id=integration.id,
             action_id="fetch_collar_observations",
             level=LogLevel.ERROR,
-            title=f"Failed to fetch observations for collar {action_config.collar_id}.",
-            data={"message": message, "data": action_config}
+            title=title,
+            data={"message": f"{title} Details: {error_reason(e)}", "data": action_config}
         )
         return {"observations_extracted": observations_extracted}
     finally:

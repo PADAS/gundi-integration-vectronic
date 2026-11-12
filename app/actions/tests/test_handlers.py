@@ -1,6 +1,6 @@
 import asyncio
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import httpx
 from app import settings
@@ -17,11 +17,13 @@ from app.actions.handlers import (
     action_fetch_collar_observations,
     checkpoints_by_receive_time,
     get_collar_key,
+    mark_pull_succeeded,
     CollarData,
     transform,
 )
 from app.actions.configurations import PullObservationsConfig, PullCollarObservationsConfig
 from app.conftest import async_return
+from gundi_client_v2.errors import AuthenticationError, GundiAPIError
 from app.services.redaction import redact_secrets, redact_text, redact_url, secret_field_names
 
 
@@ -29,6 +31,13 @@ from app.services.redaction import redact_secrets, redact_text, redact_url, secr
 def collar_key_lookup(mocker):
     # Fetch tests use a bare MagicMock integration with no pull config.
     return mocker.patch("app.actions.handlers.get_collar_key", return_value="K")
+
+
+@pytest.fixture(autouse=True)
+def last_pull_record(mocker):
+    # Keeps the cursor tests' set_state assertions about the cursor alone.
+    # The escalation tests below exercise the real record.
+    return mocker.patch("app.actions.handlers.mark_pull_succeeded", new_callable=AsyncMock)
 
 @pytest.mark.asyncio
 async def test_action_pull_observations_triggers_fetch_collar_observations(mocker, mock_publish_event, mock_state_manager):
@@ -285,7 +294,8 @@ async def test_action_fetch_collar_observations_exception_sends_error_activity_l
     assert mock_log_action_activity.call_args[1]["integration_id"] == integration.id
     assert mock_log_action_activity.call_args[1]["action_id"] == "fetch_collar_observations"
     assert mock_log_action_activity.call_args[1]["level"] == LogLevel.ERROR
-    assert mock_log_action_activity.call_args[1]["title"] == f"Failed to fetch observations for collar {config.collar_id}."
+    assert mock_log_action_activity.call_args[1]["title"] == "Observations for collar 1 didn't come through because of an unexpected problem."
+    assert mock_log_action_activity.call_args[1]["data"]["message"].endswith("Details: fail")
 
 @pytest.mark.asyncio
 async def test_action_fetch_collar_observations_forbidden_logs_warning(mocker, mock_state_manager):
@@ -362,6 +372,58 @@ async def test_action_fetch_collar_observations_collar_warning_is_throttled(mock
     assert throttle_kwargs["action_id"] == "fetch_collar_observations"
     assert throttle_kwargs["source_id"].endswith("-warning-1")
     assert throttle_kwargs["ttl_seconds"] == 3600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error, kind, title", [
+    (
+        VectronicForbiddenException(Exception("403"), "Unauthorized access"),
+        "unauthorized",
+        "Vectronic didn't send data for collar 45703 because it didn't accept the collar ID and key.",
+    ),
+    (
+        VectronicNotFoundException(Exception("404"), "Not found"),
+        "not-found",
+        "Vectronic didn't send data for collar 45703 because it doesn't know this collar ID.",
+    ),
+    (
+        httpx.HTTPStatusError(
+            "Server error",
+            request=httpx.Request("GET", "https://api.vectronic-wildlife.com/v2/collar/45703/gps"),
+            response=httpx.Response(status_code=500, request=httpx.Request("GET", "https://api.vectronic-wildlife.com/v2/collar/45703/gps")),
+        ),
+        "http-error",
+        "Vectronic didn't send data for collar 45703 because its server answered with error 500.",
+    ),
+    (
+        # A timeout's text is empty, which used to leave the reason blank.
+        httpx.ReadTimeout("", request=httpx.Request("GET", "https://api.vectronic-wildlife.com/v2/collar/45703/gps")),
+        "timeout",
+        "Vectronic didn't send data for collar 45703 because the connection timed out.",
+    ),
+    (
+        httpx.ConnectError("", request=httpx.Request("GET", "https://api.vectronic-wildlife.com/v2/collar/45703/gps")),
+        "connection",
+        "Vectronic didn't send data for collar 45703 because the connection to Vectronic failed.",
+    ),
+])
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_vectronic_problems_say_what_and_why(mocker, mock_state_manager, error, kind, title):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=error))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    integration = MagicMock(id=1, base_url=None)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    result = await action_fetch_collar_observations(integration, config)
+
+    assert result == {"observations_extracted": 0}
+    kwargs = mock_log_action_activity.call_args[1]
+    assert kwargs["level"] == LogLevel.WARNING
+    assert kwargs["title"] == title
+    assert kwargs["data"]["message"] == title
+    assert mock_state_manager.set_if_absent.call_args[1]["source_id"] == f"{kind}-warning-45703"
 
 
 @pytest.mark.asyncio
@@ -736,7 +798,11 @@ async def test_action_fetch_collar_observations_completion_entry_failure_does_no
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error, failure_title", [
-    (Exception("gundi down"), "Failed to fetch observations for collar 123."),
+    (Exception("gundi down"), "Observations for collar 123 didn't come through because of an unexpected problem."),
+    (
+        httpx.ReadTimeout("", request=httpx.Request("POST", "https://gundi.example/v2/observations/")),
+        "Observations for collar 123 didn't reach Gundi because the connection to Gundi timed out.",
+    ),
     (
         httpx.HTTPStatusError(
             "Server error",
@@ -744,7 +810,7 @@ async def test_action_fetch_collar_observations_completion_entry_failure_does_no
             response=httpx.Response(status_code=502, request=httpx.Request("POST", "https://gundi.example/v2/observations/")),
         ),
         # Gundi's error, not reported as Vectronic's.
-        "Gundi returned HTTP 502 while sending observations for collar 123.",
+        "Observations for collar 123 didn't reach Gundi because Gundi answered with error 502.",
     ),
 ])
 async def test_action_fetch_collar_observations_reports_what_was_sent_before_a_failure(mocker, mock_state_manager, error, failure_title):
@@ -823,3 +889,183 @@ def test_template_redaction_masks_the_collar_key():
     assert "SECRETKEY123" not in redact_text(message)
     # Messages published before the key left PubSub still carry collar_key.
     assert redact_secrets({"collar_id": 1, "collar_key": "SECRETKEY123"}) == {"collar_id": 1, "collar_key": "**********"}
+
+
+VECTRONIC_GPS_REQUEST = httpx.Request("GET", "https://api.vectronic-wildlife.com/v2/collar/45703/gps")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error, kind, title", [
+    (
+        httpx.ReadTimeout("", request=VECTRONIC_GPS_REQUEST),
+        "timeout",
+        "Vectronic hasn't sent data for collar 45703 for over 1 hour because the connection keeps timing out.",
+    ),
+    (
+        httpx.ConnectError("", request=VECTRONIC_GPS_REQUEST),
+        "connection",
+        "Vectronic hasn't sent data for collar 45703 for over 1 hour because the connection to Vectronic keeps failing.",
+    ),
+    (
+        httpx.HTTPStatusError("Server error", request=VECTRONIC_GPS_REQUEST, response=httpx.Response(503, request=VECTRONIC_GPS_REQUEST)),
+        "http-error",
+        "Vectronic hasn't sent data for collar 45703 for over 1 hour because its server keeps answering with errors (latest: 503).",
+    ),
+])
+async def test_action_fetch_collar_observations_outage_over_an_hour_is_an_error(mocker, mock_state_manager, error, kind, title):
+    # kind is only the warning's throttle kind; every escalated outage shares one.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    last_pull = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    mock_state_manager.get_state.return_value = async_return({"at": last_pull})
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=error))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    kwargs = mock_log_action_activity.call_args[1]
+    assert kwargs["level"] == LogLevel.ERROR
+    assert kwargs["title"] == title
+    assert mock_state_manager.set_if_absent.call_args[1]["source_id"] == "outage-escalated-warning-45703"
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_short_outage_stays_a_warning(mocker, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    last_pull = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    mock_state_manager.get_state.return_value = async_return({"at": last_pull})
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=httpx.ReadTimeout("", request=VECTRONIC_GPS_REQUEST)))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.WARNING
+    mock_state_manager.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_first_failure_starts_the_clock(mocker, mock_state_manager):
+    # No record yet (new collar, or from before this rule): the clock starts now.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mock_state_manager.get_state.return_value = async_return(None)
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=httpx.ReadTimeout("", request=VECTRONIC_GPS_REQUEST)))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.WARNING
+    assert mock_state_manager.set_state.call_args[1]["source_id"] == "last-pull-45703"
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_successful_pull_resets_the_clock(mocker, mock_state_manager):
+    mocker.patch("app.actions.handlers.mark_pull_succeeded", new=mark_pull_succeeded)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[]))
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    source_ids = [c[1]["source_id"] for c in mock_state_manager.set_state.call_args_list]
+    assert "last-pull-45703" in source_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error, title", [
+    # gundi-client-v2 3.x wraps Gundi's 4xx/5xx instead of raising httpx's error.
+    (GundiAPIError(502, "Bad gateway"), "Observations for collar 123 didn't reach Gundi because Gundi answered with error 502."),
+    (
+        httpx.ConnectError("", request=httpx.Request("POST", "https://gundi.example/v2/observations/")),
+        "Observations for collar 123 didn't reach Gundi because the connection to Gundi failed.",
+    ),
+    (AuthenticationError("token refused", status_code=401), "Observations for collar 123 didn't reach Gundi because Gundi didn't accept the integration's sign-in."),
+    (AuthenticationError("", transport=True), "Observations for collar 123 didn't reach Gundi because the connection to Gundi failed."),
+])
+async def test_action_fetch_collar_observations_gundi_client_errors_are_reported_as_gundi(mocker, mock_state_manager, error, title):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(return_value=[make_observation("2024-01-01T01:00:00", collar_id=123)]))
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", new=AsyncMock(side_effect=error))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=123)
+
+    await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    kwargs = mock_log_action_activity.call_args[1]
+    assert kwargs["level"] == LogLevel.WARNING
+    assert kwargs["title"] == title
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_escalation_check_fails_open(mocker, mock_state_manager):
+    # Redis down: report the warning rather than failing the run.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    async def get_state(**kwargs):
+        if kwargs["source_id"].startswith("last-pull-"):
+            raise Exception("redis down")
+        return None
+    mock_state_manager.get_state.side_effect = get_state
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=httpx.ReadTimeout("", request=VECTRONIC_GPS_REQUEST)))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    result = await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    assert result == {"observations_extracted": 0}
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.WARNING
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_mixed_outage_kinds_share_one_error_per_hour(mocker, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    last_pull = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    mock_state_manager.get_state.return_value = async_return({"at": last_pull})
+    reserved = set()
+
+    async def set_if_absent(**kwargs):
+        if kwargs["source_id"] in reserved:
+            return False
+        reserved.add(kwargs["source_id"])
+        return True
+    mock_state_manager.set_if_absent.side_effect = set_if_absent
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    for error in (
+        httpx.ReadTimeout("", request=VECTRONIC_GPS_REQUEST),
+        httpx.ConnectError("", request=VECTRONIC_GPS_REQUEST),
+        httpx.HTTPStatusError("Server error", request=VECTRONIC_GPS_REQUEST, response=httpx.Response(500, request=VECTRONIC_GPS_REQUEST)),
+    ):
+        mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=error))
+        await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    mock_log_action_activity.assert_awaited_once()
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.ERROR
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_rejected_request_is_never_escalated(mocker, mock_state_manager):
+    # A 4xx is a rejected request, not an outage, even after an hour without a pull.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    last_pull = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    mock_state_manager.get_state.return_value = async_return({"at": last_pull})
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    error = httpx.HTTPStatusError("Bad request", request=VECTRONIC_GPS_REQUEST, response=httpx.Response(400, request=VECTRONIC_GPS_REQUEST))
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=error))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    kwargs = mock_log_action_activity.call_args[1]
+    assert kwargs["level"] == LogLevel.WARNING
+    assert kwargs["title"] == "Vectronic didn't send data for collar 45703 because it rejected the request with error 400."
+    assert mock_state_manager.set_if_absent.call_args[1]["source_id"] == "request-rejected-warning-45703"
