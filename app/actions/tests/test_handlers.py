@@ -913,6 +913,7 @@ VECTRONIC_GPS_REQUEST = httpx.Request("GET", "https://api.vectronic-wildlife.com
     ),
 ])
 async def test_action_fetch_collar_observations_outage_over_an_hour_is_an_error(mocker, mock_state_manager, error, kind, title):
+    # kind is only the warning's throttle kind; every escalated outage shares one.
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     last_pull = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     mock_state_manager.get_state.return_value = async_return({"at": last_pull})
@@ -926,7 +927,7 @@ async def test_action_fetch_collar_observations_outage_over_an_hour_is_an_error(
     kwargs = mock_log_action_activity.call_args[1]
     assert kwargs["level"] == LogLevel.ERROR
     assert kwargs["title"] == title
-    assert mock_state_manager.set_if_absent.call_args[1]["source_id"] == f"{kind}-escalated-warning-45703"
+    assert mock_state_manager.set_if_absent.call_args[1]["source_id"] == "outage-escalated-warning-45703"
 
 
 @pytest.mark.asyncio
@@ -1019,3 +1020,52 @@ async def test_action_fetch_collar_observations_escalation_check_fails_open(mock
 
     assert result == {"observations_extracted": 0}
     assert mock_log_action_activity.call_args[1]["level"] == LogLevel.WARNING
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_mixed_outage_kinds_share_one_error_per_hour(mocker, mock_state_manager):
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    last_pull = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    mock_state_manager.get_state.return_value = async_return({"at": last_pull})
+    reserved = set()
+
+    async def set_if_absent(**kwargs):
+        if kwargs["source_id"] in reserved:
+            return False
+        reserved.add(kwargs["source_id"])
+        return True
+    mock_state_manager.set_if_absent.side_effect = set_if_absent
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    for error in (
+        httpx.ReadTimeout("", request=VECTRONIC_GPS_REQUEST),
+        httpx.ConnectError("", request=VECTRONIC_GPS_REQUEST),
+        httpx.HTTPStatusError("Server error", request=VECTRONIC_GPS_REQUEST, response=httpx.Response(500, request=VECTRONIC_GPS_REQUEST)),
+    ):
+        mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=error))
+        await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    mock_log_action_activity.assert_awaited_once()
+    assert mock_log_action_activity.call_args[1]["level"] == LogLevel.ERROR
+
+
+@pytest.mark.asyncio
+async def test_action_fetch_collar_observations_rejected_request_is_never_escalated(mocker, mock_state_manager):
+    # A 4xx is a rejected request, not an outage, even after an hour without a pull.
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    last_pull = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    mock_state_manager.get_state.return_value = async_return({"at": last_pull})
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    error = httpx.HTTPStatusError("Bad request", request=VECTRONIC_GPS_REQUEST, response=httpx.Response(400, request=VECTRONIC_GPS_REQUEST))
+    mocker.patch("app.actions.handlers.client.get_observations", new=AsyncMock(side_effect=error))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new_callable=AsyncMock)
+    config = PullCollarObservationsConfig(start="2024-01-01T00:00:00", collar_id=45703)
+
+    await action_fetch_collar_observations(MagicMock(id=1, base_url=None), config)
+
+    kwargs = mock_log_action_activity.call_args[1]
+    assert kwargs["level"] == LogLevel.WARNING
+    assert kwargs["title"] == "Vectronic didn't send data for collar 45703 because it rejected the request with error 400."
+    assert mock_state_manager.set_if_absent.call_args[1]["source_id"] == "request-rejected-warning-45703"

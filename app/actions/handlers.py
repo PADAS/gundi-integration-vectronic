@@ -343,7 +343,9 @@ async def log_vectronic_outage(integration, action_config, kind: str, warning_ti
     """A temporary Vectronic problem: a warning at first, an error once the
     collar has gone ESCALATION_AFTER without a successful pull."""
     if await outage_is_escalated(integration.id, action_config.collar_id):
-        await log_collar_problem(integration, action_config, kind=f"{kind}-escalated", title=escalated_title, level=LogLevel.ERROR)
+        # One shared kind: at most one ERROR per collar per hour, whichever
+        # mix of timeouts, connection failures and server errors caused it.
+        await log_collar_problem(integration, action_config, kind="outage-escalated", title=escalated_title, level=LogLevel.ERROR)
     else:
         await log_collar_problem(integration, action_config, kind=kind, title=warning_title)
 
@@ -473,11 +475,19 @@ async def action_fetch_collar_observations(integration, action_config: PullColla
         # Other 4xx/5xx responses from the collar API (403/404 are handled above).
         status_code = e.response.status_code
         logger.warning(f"Vectronic returned HTTP {status_code} for collar {action_config.collar_id} (integration {integration.id}): {error_detail(e)}")
-        await log_vectronic_outage(
-            integration, action_config, kind="http-error",
-            warning_title=f"Vectronic didn't send data for collar {action_config.collar_id} because its server answered with error {status_code}.",
-            escalated_title=f"Vectronic hasn't sent data for collar {action_config.collar_id} for over 1 hour because its server keeps answering with errors (latest: {status_code}).",
-        )
+        if status_code >= 500 or status_code == 429:
+            # Vectronic down or throttling: temporary, escalates like a timeout.
+            await log_vectronic_outage(
+                integration, action_config, kind="http-error",
+                warning_title=f"Vectronic didn't send data for collar {action_config.collar_id} because its server answered with error {status_code}.",
+                escalated_title=f"Vectronic hasn't sent data for collar {action_config.collar_id} for over 1 hour because its server keeps answering with errors (latest: {status_code}).",
+            )
+        else:
+            # A rejected request, not an outage.
+            await log_collar_problem(
+                integration, action_config, kind="request-rejected",
+                title=f"Vectronic didn't send data for collar {action_config.collar_id} because it rejected the request with error {status_code}.",
+            )
         return {"observations_extracted": observations_extracted}
     except httpx.TimeoutException as e:
         logger.warning(f"Vectronic timed out for collar {action_config.collar_id} (integration {integration.id}): {error_detail(e)}")
